@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 )
 
 func computeTPS(outputTokens, durationMs, firstTokenMs, minGenerationMs int64) float64 {
@@ -63,32 +65,21 @@ func refreshAuthProxyCache() map[string]string {
 	}
 	authProxyMu.Unlock()
 
-	// listAuthFiles is itself cached; this rebuild does not stampede Host API.
 	out := map[string]string{}
-	auths, err := listAuthFiles()
-	if err == nil {
-		for _, a := range auths {
-			if a.ProxyURL == "" {
-				continue
-			}
-			if a.Index != "" {
-				out[a.Index] = a.ProxyURL
-			}
-			if a.ID != "" {
-				out[a.ID] = a.ProxyURL
-			}
-			if a.Name != "" {
-				out[a.Name] = a.ProxyURL
-				out[strings.TrimSuffix(a.Name, ".json")] = a.ProxyURL
-			}
-			if a.Email != "" {
-				out["xai-"+a.Email+".json"] = a.ProxyURL
-				out[a.Email] = a.ProxyURL
-			}
-			if a.Path != "" {
-				out[a.Path] = a.ProxyURL
-				out[filepath.Base(a.Path)] = a.ProxyURL
-			}
+	if store != nil {
+		if idx := store.authProxyIndexSnapshot(); len(idx) > 0 {
+			out = idx
+		}
+	}
+	authListMu.Lock()
+	warm := authListCache
+	authListMu.Unlock()
+	for _, a := range warm {
+		if a.ProxyURL == "" {
+			continue
+		}
+		for _, key := range authIndexKeys(a) {
+			out[key] = a.ProxyURL
 		}
 	}
 
@@ -282,22 +273,30 @@ func outputTokensFromUsage(usage map[string]any) int64 {
 }
 
 func httpClientThroughProxy(proxyURL string, timeout time.Duration) (*http.Client, error) {
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: 15 * time.Second,
+	proxyURL = strings.TrimSpace(proxyURL)
+	if repaired, ok := repairBareIPv6ProxyURL(proxyURL); ok {
+		proxyURL = repaired
 	}
-	if strings.TrimSpace(proxyURL) != "" {
-		u, err := url.Parse(proxyURL)
+	if proxyURL == "" {
+		return &http.Client{Timeout: timeout, Transport: proxyutil.NewDirectTransport()}, nil
+	}
+	transport, mode, err := proxyutil.BuildHTTPTransport(proxyURL)
+	if err != nil || transport == nil || mode != proxyutil.ModeProxy {
 		if err != nil {
-			return nil, fmt.Errorf("代理 URL 无效")
+			return nil, fmt.Errorf("代理 URL 无效: %w", err)
 		}
-		transport.Proxy = http.ProxyURL(u)
+		return nil, fmt.Errorf("代理 URL 无效")
 	}
 	return &http.Client{Timeout: timeout, Transport: transport}, nil
+}
+
+// Dual-stack exit-IP endpoints. IPv6-only SOCKS exits cannot CONNECT to
+// api.ipify.org (A-only) and return "host unreachable".
+var connectivityProbeURLs = []string{
+	"https://api64.ipify.org",
+	"https://api6.ipify.org",
+	"https://api.ipify.org",
+	"https://ifconfig.co/ip",
 }
 
 func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err error) {
@@ -306,37 +305,61 @@ func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err err
 		return "", 0, err
 	}
 	start := time.Now()
-	req, _ := http.NewRequest(http.MethodGet, "https://api.ipify.org", nil)
+	var last error
+	for _, target := range connectivityProbeURLs {
+		ip, probeErr := fetchExitIP(client, target)
+		if probeErr == nil {
+			return ip, time.Since(start).Milliseconds(), nil
+		}
+		last = probeErr
+	}
+	if last == nil {
+		last = fmt.Errorf("连通性失败")
+	}
+	return "", time.Since(start).Milliseconds(), last
+}
+
+func fetchExitIP(client *http.Client, target string) (string, error) {
+	if client == nil {
+		return "", fmt.Errorf("http client 为空")
+	}
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("User-Agent", "CPA-egress-guard/1.0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", time.Since(start).Milliseconds(), err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
 	ip := strings.TrimSpace(string(body))
-	if resp.StatusCode >= 400 || ip == "" {
-		return "", time.Since(start).Milliseconds(), fmt.Errorf("连通性失败 HTTP %d", resp.StatusCode)
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("连通性失败 HTTP %d", resp.StatusCode)
 	}
-	return ip, time.Since(start).Milliseconds(), nil
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("连通性失败：未返回有效 IP")
+	}
+	return ip, nil
 }
 
 type qualityResult struct {
-	Classification   string  `json:"classification"`
-	TPS              float64 `json:"tps"`
-	OutputTokens     int64   `json:"output_tokens"`
-	DurationMs       int64   `json:"duration_ms"`
-	FirstTokenMs     int64   `json:"first_token_ms"`
-	HasThinking      bool    `json:"has_thinking,omitempty"`
-	ExpectedMatched  bool    `json:"expected_matched"`
-	ProfileID        string  `json:"profile_id,omitempty"`
-	ProfileName      string  `json:"profile_name,omitempty"`
-	AuthID           string  `json:"auth_id,omitempty"`
-	AuthLabel        string  `json:"auth_label,omitempty"`
-	ExitIP           string  `json:"exit_ip,omitempty"`
-	Error            string  `json:"error,omitempty"`
-	ErrorKind        string  `json:"error_kind,omitempty"`
-	Model            string  `json:"model,omitempty"`
+	Classification  string  `json:"classification"`
+	TPS             float64 `json:"tps"`
+	OutputTokens    int64   `json:"output_tokens"`
+	DurationMs      int64   `json:"duration_ms"`
+	FirstTokenMs    int64   `json:"first_token_ms"`
+	HasThinking     bool    `json:"has_thinking,omitempty"`
+	ExpectedMatched bool    `json:"expected_matched"`
+	ProfileID       string  `json:"profile_id,omitempty"`
+	ProfileName     string  `json:"profile_name,omitempty"`
+	AuthID          string  `json:"auth_id,omitempty"`
+	AuthLabel       string  `json:"auth_label,omitempty"`
+	ExitIP          string  `json:"exit_ip,omitempty"`
+	Error           string  `json:"error,omitempty"`
+	ErrorKind       string  `json:"error_kind,omitempty"`
+	Model           string  `json:"model,omitempty"`
 }
 
 func rotationAllowed(cfg pluginConfig, nodeID string) bool {

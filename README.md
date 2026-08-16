@@ -60,7 +60,7 @@
 
 ### CPA 原生出口守护插件
 
-`cpa-plugin/` 现为 **v1.0.9 纯 CPA 原生插件**，不依赖、不连接 Grok2API 运行时。它通过 CPA Host API 读取认证文件和 Usage 事件，把账号的 `proxy_url` 粘性绑定到出口节点，并提供节点 CRUD、逐行批量导入、批量操作、连通性/真实质量检测、可配置探针方案（吞吐基线 / 预期标记 / 自定义 Prompt）、隔离迁号、策略热加载、统计事件和深浅色管理 UI。v1.0.9 起主动探测可按方案校验最后一行或正则标记；v1.0.8 起商店安装后注册不再同步扫认证文件，避免多账号时一直「未生效」；v1.0.7 起 CPA 调度跳过隔离/冷却出口，账号或额度错误只记为 ignored，迁移会写后读回校验，并支持节点白名单化的内部换 IP Webhook。构建与部署方法见 [cpa-plugin/README.md](./cpa-plugin/README.md)，代理规划、账号容量、隔离恢复和强制住宅 IP 轮换见 [AI 部署与运维指南](./cpa-plugin/AI_USAGE_GUIDE.md)。
+`cpa-plugin/` 现为 **v1.0.10 纯 CPA 原生插件**，不依赖、不连接 Grok2API 运行时。它通过 CPA Host API 读取认证文件和 Usage 事件，把账号的 `proxy_url` 粘性绑定到出口节点，并提供节点 CRUD、逐行批量导入、批量操作、连通性/真实质量检测、可配置探针方案（吞吐基线 / 预期标记 / 自定义 Prompt）、隔离迁号、策略热加载、统计事件和深浅色管理 UI。v1.0.10 起管理页不再对上万账号做 N+1 `host.auth.get`，连通探测支持纯 IPv6 SOCKS（`api64`/`api6`），并正确识别 `socks5h://` 与未加括号的 IPv6 代理 URL；v1.0.9 起主动探测可按方案校验最后一行或正则标记；v1.0.8 起商店安装后注册不再同步扫认证文件，避免多账号时一直「未生效」；v1.0.7 起 CPA 调度跳过隔离/冷却出口，账号或额度错误只记为 ignored，迁移会写后读回校验，并支持节点白名单化的内部换 IP Webhook。构建与部署方法见 [cpa-plugin/README.md](./cpa-plugin/README.md)，代理规划、账号容量、隔离恢复和强制住宅 IP 轮换见 [AI 部署与运维指南](./cpa-plugin/AI_USAGE_GUIDE.md)。
 
 推荐的完整链路部署方式（家宽/Resin → Mihomo 分片与监听器 → Grok2API/CPA 出口节点 → Quality Guard 检测、摘流、轮换与复测）见[推荐出口部署方式](./docs/RECOMMENDED_DEPLOYMENT.md)。
 

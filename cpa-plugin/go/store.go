@@ -3,29 +3,31 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	ActiveIntervalSec    int     `json:"active_interval_seconds"`
-	PassivePollSec       int     `json:"passive_poll_seconds"`
-	QuarantineSec        int     `json:"quarantine_seconds"`
-	SoftTPS              float64 `json:"soft_tps"`
-	HardTPS              float64 `json:"hard_tps"`
-	ConsecutiveSoft      int     `json:"consecutive_soft"`
-	ConsecutiveErrors    int     `json:"consecutive_errors"`
-	MinHealthyNodes      int     `json:"min_healthy_nodes"`
-	MinGenerationMs      int64   `json:"min_generation_ms"`
-	MinOutputTokens      int64   `json:"min_output_tokens"`
-	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
+	Mode              string  `json:"mode"`
+	ActiveIntervalSec int     `json:"active_interval_seconds"`
+	PassivePollSec    int     `json:"passive_poll_seconds"`
+	QuarantineSec     int     `json:"quarantine_seconds"`
+	SoftTPS           float64 `json:"soft_tps"`
+	HardTPS           float64 `json:"hard_tps"`
+	ConsecutiveSoft   int     `json:"consecutive_soft"`
+	ConsecutiveErrors int     `json:"consecutive_errors"`
+	MinHealthyNodes   int     `json:"min_healthy_nodes"`
+	MinGenerationMs   int64   `json:"min_generation_ms"`
+	MinOutputTokens   int64   `json:"min_output_tokens"`
+	Model             string  `json:"model"`
+	DisableAuthOnHard bool    `json:"disable_auth_on_hard"`
 	// ThinkingGuard enables missing-thinking 降智 detection. When false, quality
 	// classification falls back to the original soft/hard Token/s thresholds only.
 	// Absent in old state.json → default true (see normalizePolicy).
@@ -122,28 +124,29 @@ type statistics struct {
 
 // authDegradeRecord tracks per-account 降智 (missing-thinking) hits.
 type authDegradeRecord struct {
-	AuthID         string  `json:"auth_id"`
-	Label          string  `json:"label,omitempty"`
-	DegradedCount  int64   `json:"degraded_count"`
-	SampleCount    int64   `json:"sample_count"`
-	LastAt         float64 `json:"last_at,omitempty"`
-	LastReason     string  `json:"last_reason,omitempty"`
-	LastNodeID     string  `json:"last_node_id,omitempty"`
-	LastNodeName   string  `json:"last_node_name,omitempty"`
-	LastOutputTPS  float64 `json:"last_output_tps,omitempty"`
-	LastSource     string  `json:"last_source,omitempty"`
+	AuthID        string  `json:"auth_id"`
+	Label         string  `json:"label,omitempty"`
+	DegradedCount int64   `json:"degraded_count"`
+	SampleCount   int64   `json:"sample_count"`
+	LastAt        float64 `json:"last_at,omitempty"`
+	LastReason    string  `json:"last_reason,omitempty"`
+	LastNodeID    string  `json:"last_node_id,omitempty"`
+	LastNodeName  string  `json:"last_node_name,omitempty"`
+	LastOutputTPS float64 `json:"last_output_tps,omitempty"`
+	LastSource    string  `json:"last_source,omitempty"`
 }
 
 type guardState struct {
-	Version    int                           `json:"version"`
-	Policy     policyConfig                  `json:"policy"`
-	Nodes      map[string]*nodeRecord        `json:"nodes"`
-	Profiles   map[string]*ProbeProfile      `json:"profiles"`
-	Events     []guardEvent                  `json:"events"`
-	Stats      statistics                    `json:"statistics"`
-	AuthStats  map[string]*authDegradeRecord `json:"auth_stats"`
-	NextID     int                           `json:"next_id"`
-	UpdatedAt  float64                       `json:"updated_at"`
+	Version        int                           `json:"version"`
+	Policy         policyConfig                  `json:"policy"`
+	Nodes          map[string]*nodeRecord        `json:"nodes"`
+	Profiles       map[string]*ProbeProfile      `json:"profiles"`
+	Events         []guardEvent                  `json:"events"`
+	Stats          statistics                    `json:"statistics"`
+	AuthStats      map[string]*authDegradeRecord `json:"auth_stats"`
+	AuthProxyIndex map[string]string             `json:"auth_proxy_index,omitempty"`
+	NextID         int                           `json:"next_id"`
+	UpdatedAt      float64                       `json:"updated_at"`
 }
 
 type stateStore struct {
@@ -325,6 +328,9 @@ func (s *stateStore) load() error {
 	if data.Profiles == nil {
 		data.Profiles = map[string]*ProbeProfile{}
 	}
+	if data.AuthProxyIndex == nil {
+		data.AuthProxyIndex = map[string]string{}
+	}
 	if data.NextID <= 0 {
 		data.NextID = 1
 	}
@@ -352,6 +358,10 @@ func (s *stateStore) load() error {
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
 		n.ProxyURL = n.ProxyURLStored
+		if normalized, err := normalizeProxyURL(n.ProxyURL); err == nil {
+			n.ProxyURL = normalized
+			n.ProxyURLStored = normalized
+		}
 	}
 	s.data = data
 	// Persist once when redesign migration ran so defaults become explicit keys.
@@ -567,13 +577,17 @@ func (s *stateStore) createNodes(inputs []nodeCreateInput) ([]*nodeRecord, error
 	}
 	for index := range inputs {
 		inputs[index].Name = strings.TrimSpace(inputs[index].Name)
-		inputs[index].ProxyURL = strings.TrimSpace(inputs[index].ProxyURL)
-		if inputs[index].Name == "" || inputs[index].ProxyURL == "" {
-			return nil, fmt.Errorf("第 %d 个节点缺少名称或代理 URL", index+1)
-		}
-		if err := validateProxyURL(inputs[index].ProxyURL); err != nil {
+		normalized, err := normalizeProxyURL(inputs[index].ProxyURL)
+		if err != nil {
 			return nil, fmt.Errorf("第 %d 个节点代理 URL 无效: %w", index+1, err)
 		}
+		if err := validateProxyURL(normalized); err != nil {
+			return nil, fmt.Errorf("第 %d 个节点代理 URL 无效: %w", index+1, err)
+		}
+		if inputs[index].Name == "" {
+			return nil, fmt.Errorf("第 %d 个节点缺少名称或代理 URL", index+1)
+		}
+		inputs[index].ProxyURL = normalized
 		if inputs[index].AccountCapacity < 0 || inputs[index].AccountCapacity > 100000 {
 			return nil, fmt.Errorf("第 %d 个节点容量需在 0 到 100000 之间", index+1)
 		}
@@ -627,9 +641,14 @@ func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRe
 		return nil, err
 	}
 	if n.ProxyURL != "" {
-		if err := validateProxyURL(n.ProxyURL); err != nil {
+		normalized, err := normalizeProxyURL(n.ProxyURL)
+		if err != nil {
 			return nil, err
 		}
+		if err := validateProxyURL(normalized); err != nil {
+			return nil, err
+		}
+		n.ProxyURL = normalized
 	}
 	n.UpdatedAt = time.Now().UTC()
 	// Quarantine / enable / proxy changes must hit disk immediately so a crash
@@ -653,16 +672,74 @@ func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRe
 }
 
 func validateProxyURL(raw string) error {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Host == "" {
+	normalized, err := normalizeProxyURL(raw)
+	if err != nil {
+		return err
+	}
+	u, err := url.Parse(normalized)
+	if err != nil || u.Host == "" || u.Hostname() == "" {
 		return fmt.Errorf("代理 URL 必须包含主机和端口")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https", "socks5", "socks5h":
-		return nil
 	default:
 		return fmt.Errorf("代理协议仅支持 http、https、socks5 或 socks5h")
 	}
+	if u.Port() == "" {
+		return fmt.Errorf("代理 URL 必须包含端口")
+	}
+	return nil
+}
+
+// normalizeProxyURL accepts socks5h://user:pass@[2001:db8::1]:1080 and the
+// common unbracketed paste socks5h://user:pass@2001:db8::1:1080.
+func normalizeProxyURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("代理 URL 必须包含主机和端口")
+	}
+	if repaired, ok := repairBareIPv6ProxyURL(raw); ok {
+		raw = repaired
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Hostname() == "" {
+		return "", fmt.Errorf("代理 URL 必须包含主机和端口")
+	}
+	return raw, nil
+}
+
+func repairBareIPv6ProxyURL(raw string) (string, bool) {
+	scheme, rest, ok := strings.Cut(raw, "://")
+	if !ok || rest == "" {
+		return "", false
+	}
+	var userinfo string
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		userinfo = rest[:at]
+		rest = rest[at+1:]
+	}
+	if rest == "" || strings.HasPrefix(rest, "[") {
+		return "", false
+	}
+	colon := strings.LastIndex(rest, ":")
+	if colon < 0 {
+		return "", false
+	}
+	host, port := rest[:colon], rest[colon+1:]
+	if host == "" || strings.Count(host, ":") < 2 {
+		return "", false
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		return "", false
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.To4() != nil {
+		return "", false
+	}
+	out := scheme + "://"
+	if userinfo != "" {
+		out += userinfo + "@"
+	}
+	return out + "[" + host + "]:" + port, true
 }
 
 func (s *stateStore) deleteNodes(ids []string) error {
@@ -706,7 +783,6 @@ func (s *stateStore) events() []guardEvent {
 	copy(out, s.data.Events)
 	return out
 }
-
 
 func (s *stateStore) recordAuthObservation(authID, label, source, nodeID, nodeName, class, reason string, tps float64, degraded bool) {
 	authID = strings.TrimSpace(authID)
@@ -796,7 +872,6 @@ func (s *stateStore) clearAuthDegradeStats() {
 	_ = s.flushNowLocked()
 }
 
-
 func (s *stateStore) stats() statistics {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -848,6 +923,60 @@ func (s *stateStore) setAssignedCounts(counts map[string]int) {
 	defer s.mu.Unlock()
 	for id, n := range s.data.Nodes {
 		n.AssignedAccountCount = counts[id]
+	}
+	s.scheduleFlushLocked()
+}
+
+func (s *stateStore) replaceAuthProxyIndex(index map[string]string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index == nil {
+		s.data.AuthProxyIndex = map[string]string{}
+	} else {
+		s.data.AuthProxyIndex = index
+	}
+	s.scheduleFlushLocked()
+}
+
+func (s *stateStore) authProxyIndexSnapshot() map[string]string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.data.AuthProxyIndex) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(s.data.AuthProxyIndex))
+	for key, proxy := range s.data.AuthProxyIndex {
+		out[key] = proxy
+	}
+	return out
+}
+
+func (s *stateStore) patchAuthProxyKeys(keys []string, proxy string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.AuthProxyIndex == nil {
+		s.data.AuthProxyIndex = map[string]string{}
+	}
+	proxy = strings.TrimSpace(proxy)
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if proxy == "" {
+			delete(s.data.AuthProxyIndex, key)
+			continue
+		}
+		s.data.AuthProxyIndex[key] = proxy
 	}
 	s.scheduleFlushLocked()
 }

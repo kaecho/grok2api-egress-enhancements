@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.9"
+	pluginVersion       = "1.0.10"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -340,7 +340,7 @@ func pluginRegistration() registration {
 			Name:             pluginName,
 			Version:          pluginVersion,
 			Author:           "lij768423-svg",
-			GitHubRepository: "https://github.com/lij768423-svg/grok2api-egress-enhancements",
+			GitHubRepository: "https://github.com/kaecho/grok2api-egress-enhancements",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "出口守护状态文件路径（节点/策略/事件）"},
 				{Name: "rotation_url", Type: pluginapi.ConfigFieldTypeString, Description: "可选、受信任的内部换 IP Webhook；仅对 rotatable_node_ids 生效"},
@@ -539,7 +539,9 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 	case path == "/nodes":
 		if method == http.MethodGet {
-			refreshAssignedCounts(store)
+			// Never sweep host.auth.get on the management GET path. 10k+
+			// accounts used to freeze the page on 「正在加载节点」; assigned
+			// counts come from persisted state + the background worker.
 			items := store.listNodes()
 			out := make([]map[string]any, 0, len(items))
 			for _, n := range items {
@@ -777,7 +779,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
 }
 
-
 func renderPageHTML() string {
 	out := pageTemplate
 	out = strings.Replace(out, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
@@ -788,7 +789,8 @@ func renderPageHTML() string {
 
 func buildStatus() map[string]any {
 	ensureStore()
-	refreshAssignedCounts(store)
+	// Do not call refreshAssignedCounts here: it can cold-start N host.auth.get
+	// calls and stall the status request that the UI waits on.
 	nodes := store.listNodes()
 	nodeMap := map[string]any{}
 	for _, n := range nodes {
@@ -797,7 +799,7 @@ func buildStatus() map[string]any {
 			"quarantined_until":   n.QuarantinedUntil,
 			"error_strikes":       n.ErrorStrikes,
 			"soft_strikes":        n.SoftStrikes,
-				"thinking_strikes":    n.ThinkingStrikes,
+			"thinking_strikes":    n.ThinkingStrikes,
 			"last_classification": n.LastClassification,
 			"last_output_tps":     n.LastOutputTPS,
 			"last_first_token_ms": n.LastFirstTokenMs,

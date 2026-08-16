@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.9** |
+| 当前版本 | **1.0.10** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -195,7 +195,7 @@ https://raw.githubusercontent.com/router-for-me/CLIProxyAPI-Plugins-Store/main/r
 ```yaml
 plugins:
   store-sources:
-    - "https://raw.githubusercontent.com/lij768423-svg/grok2api-egress-enhancements/main/cpa-plugin/registry.json"
+    - "https://raw.githubusercontent.com/kaecho/grok2api-egress-enhancements/main/cpa-plugin/registry.json"
 ```
 
 重启 CPA 后，在插件商店搜索：
@@ -231,7 +231,7 @@ plugins:
 - 查看 CPA 日志中的 `pluginhost: failed to load plugin grok2api-egress` / `plugin … register failed`
 - 确认 `.so` 与 CPA 同架构、同 libc（官方 CPA 镜像为 Debian/glibc；Alpine/musl 需自行编译）
 
-也可直接从仓库 [Release](https://github.com/lij768423-svg/grok2api-egress-enhancements/releases) 下载 zip，校验 `checksums.txt` 后按下面的手动方式安装。
+也可直接从仓库 [Release](https://github.com/kaecho/grok2api-egress-enhancements/releases) 下载 zip，校验 `checksums.txt` 后按下面的手动方式安装。
 
 ### 手动安装
 
@@ -380,6 +380,12 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 ## 性能（v1.0.8）
 
 低配机器上若出现 CPA 整体变卡 / CPU 打满，通常不是探测本身，而是旧版热路径对 `host.auth.list` + N 次 `host.auth.get` 的反复全量扫描，以及每条 usage 事件全量 `MarshalIndent` 写 `state.json`。
+
+v1.0.10 起：
+
+- 管理页 `GET /nodes` / `/status` 不再同步扫 `host.auth.get`；账号绑定从磁盘 `proxy_url` + 持久化索引读取
+- 连通探测依次打 `api64.ipify.org` / `api6.ipify.org` / `api.ipify.org`，纯 IPv6 SOCKS 出口不再因 `host unreachable` 误报
+- `socks5h://` 走 CPA `proxyutil` SOCKS 拨号；未加括号的 IPv6 代理 URL（`user:pass@2001:db8::1:1080`）会自动补 `[]`
 
 v1.0.8 起额外修复商店安装后一直「未生效 / 未注册」：
 

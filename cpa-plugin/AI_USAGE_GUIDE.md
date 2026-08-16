@@ -1,6 +1,6 @@
 # CPA 出口守护 AI 部署与运维指南
 
-本文用于让 AI 工具或运维人员从零部署、配置和维护 `grok2api-egress` v1.0.9。插件是纯 CPA 原生实现，只读写 CLIProxyAPI（下称 CPA）的 xAI auth 文件和 Usage 事件，不依赖 Grok2API 运行时。
+本文用于让 AI 工具或运维人员从零部署、配置和维护 `grok2api-egress` v1.0.10。插件是纯 CPA 原生实现，只读写 CLIProxyAPI（下称 CPA）的 xAI auth 文件和 Usage 事件，不依赖 Grok2API 运行时。
 
 如果部署包含 Mihomo、家宽 sticky 会话或 Resin 动态池，请先阅读[推荐出口部署方式](../docs/RECOMMENDED_DEPLOYMENT.md)，再回到本文执行 CPA 节点添加、账号重平衡和 Guard 策略配置。本文的“方案 A/B”是单节点接入细节，不替代上游分片与故障域规划。
 
@@ -104,8 +104,10 @@ http://<PROXY_USER_C>:<PROXY_PASS>@<PROXY_HOST>:<PROXY_PORT>
 ```bash
 curl --fail --max-time 20 \
   --proxy 'http://<PROXY_USER_A>:<PROXY_PASS>@<PROXY_HOST>:<PROXY_PORT>' \
-  https://api.ipify.org
+  https://api64.ipify.org
 ```
+
+纯 IPv6 出口请用 `https://api64.ipify.org` 或 `https://api6.ipify.org`。`https://api.ipify.org` 只有 A 记录，IPv6-only SOCKS 会返回 `host unreachable`。插件连通检测会按 `api64` → `api6` → `api.ipify` 回退。
 
 三个会话应能连通，且应得到预期的不同出口 IP。
 
@@ -615,12 +617,12 @@ auth 到代理的映射仍有短缓存，后台隔离复测最多受 worker 扫�
 
 ### 同时出现“检测成功”和“检测失败”
 
-连通检测与真实模型质量检测是两条不同链路：代理能访问 `api.ipify.org` 只代表网络通，模型请求仍可能因 token、权限、限流或质量分类失败。以事件的检测类型、HTTP 状态和时间为准，不要只看一条 toast。
+连通检测与真实模型质量检测是两条不同链路：代理能访问 `api64.ipify.org` 只代表网络通，模型请求仍可能因 token、权限、限流或质量分类失败。以事件的检测类型、HTTP 状态和时间为准，不要只看一条 toast。
 
 ## 12. 给 AI 工具的推荐任务提示词
 
 ```text
-你正在部署 grok2api-egress-enhancements/cpa-plugin v1.0.9。
+你正在部署 grok2api-egress-enhancements/cpa-plugin v1.0.10。
 
 先阅读：
 1. cpa-plugin/README.md

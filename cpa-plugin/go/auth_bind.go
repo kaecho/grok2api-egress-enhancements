@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -114,49 +115,164 @@ func fetchAuthFilesFromHost() ([]authFile, error) {
 	}
 	var resp hostAuthListResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		// some hosts return bare array
 		var files []pluginapi.HostAuthFileEntry
 		if err2 := json.Unmarshal(raw, &files); err2 != nil {
 			return nil, fmt.Errorf("decode auth list: %w", err)
 		}
 		resp.Files = files
 	}
+	// 10k+ hosts: never N+1 host.auth.get on first paint / reconcile.
+	index := map[string]string{}
+	if store != nil {
+		index = store.authProxyIndexSnapshot()
+	}
 	out := make([]authFile, 0, len(resp.Files))
+	indexOut := map[string]string{}
 	for _, f := range resp.Files {
-		idx := strings.TrimSpace(f.AuthIndex)
-		if idx == "" {
-			idx = strings.TrimSpace(f.ID)
-		}
-		if idx == "" {
-			idx = strings.TrimSpace(f.Name)
-		}
-		if idx == "" {
+		a, ok := authFileFromListEntry(f, index)
+		if !ok {
 			continue
 		}
-		// prefer xai provider/type from list entry
-		prov := strings.ToLower(strings.TrimSpace(f.Provider + " " + f.Type + " " + f.Name))
-		if prov != "" && !strings.Contains(prov, "xai") {
+		out = append(out, a)
+		if a.ProxyURL == "" {
 			continue
 		}
-		got, err := getAuthFile(idx)
-		if err != nil {
-			// try by name
-			if f.Name != "" {
-				got, err = getAuthFile(f.Name)
-			}
-			if err != nil {
-				continue
-			}
+		for _, key := range authIndexKeys(a) {
+			indexOut[key] = a.ProxyURL
 		}
-		if t, _ := got.Raw["type"].(string); strings.ToLower(t) != "xai" && strings.ToLower(t) != "" {
-			if !strings.HasPrefix(strings.ToLower(got.Name), "xai-") {
-				continue
-			}
-		}
-		got.ID = strings.TrimSpace(f.ID)
-		out = append(out, got)
+	}
+	if store != nil {
+		store.replaceAuthProxyIndex(indexOut)
 	}
 	return out, nil
+}
+
+func isXAIAuthEntry(f pluginapi.HostAuthFileEntry) bool {
+	prov := strings.ToLower(strings.TrimSpace(f.Provider + " " + f.Type + " " + f.Name))
+	if prov == "" {
+		return true
+	}
+	return strings.Contains(prov, "xai") || strings.Contains(prov, "grok")
+}
+
+func authFileFromListEntry(f pluginapi.HostAuthFileEntry, index map[string]string) (authFile, bool) {
+	idx := strings.TrimSpace(f.AuthIndex)
+	if idx == "" {
+		idx = strings.TrimSpace(f.ID)
+	}
+	if idx == "" {
+		idx = strings.TrimSpace(f.Name)
+	}
+	if idx == "" {
+		return authFile{}, false
+	}
+	if !isXAIAuthEntry(f) {
+		return authFile{}, false
+	}
+	name := strings.TrimSpace(f.Name)
+	if name == "" {
+		name = filepath.Base(strings.TrimSpace(f.Path))
+	}
+	email := strings.TrimSpace(f.Email)
+	if name == "" && email != "" {
+		name = "xai-" + email + ".json"
+	}
+	a := authFile{
+		ID:       strings.TrimSpace(f.ID),
+		Index:    idx,
+		Name:     name,
+		Path:     strings.TrimSpace(f.Path),
+		Email:    email,
+		Disabled: f.Disabled,
+		Raw:      map[string]any{"type": "xai", "disabled": f.Disabled},
+	}
+	if email != "" {
+		a.Raw["email"] = email
+	}
+	if proxy, diskEmail, diskDisabled, ok := peekAuthBindingOnDisk(a.Path); ok {
+		a.ProxyURL = proxy
+		a.Disabled = diskDisabled
+		a.Raw["disabled"] = diskDisabled
+		if diskEmail != "" {
+			a.Email = diskEmail
+			a.Raw["email"] = diskEmail
+		}
+	} else if proxy := lookupAuthProxy(index, a); proxy != "" {
+		a.ProxyURL = proxy
+	} else if strings.TrimSpace(a.Path) == "" {
+		// Memory-only / test fixtures have no path; a single get is required.
+		// File-backed production auths never take this branch.
+		if got, err := getAuthFile(idx); err == nil {
+			if got.ID == "" {
+				got.ID = a.ID
+			}
+			if got.Index == "" {
+				got.Index = a.Index
+			}
+			return got, true
+		}
+	}
+	if a.ProxyURL != "" {
+		a.Raw["proxy_url"] = a.ProxyURL
+	}
+	return a, true
+}
+
+func peekAuthBindingOnDisk(path string) (proxy, email string, disabled, ok bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", "", false, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return "", "", false, false
+	}
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return "", "", false, false
+	}
+	proxy, _ = obj["proxy_url"].(string)
+	email, _ = obj["email"].(string)
+	disabled, _ = obj["disabled"].(bool)
+	return strings.TrimSpace(proxy), strings.TrimSpace(email), disabled, true
+}
+
+func lookupAuthProxy(index map[string]string, a authFile) string {
+	if len(index) == 0 {
+		return ""
+	}
+	for _, key := range authIndexKeys(a) {
+		if proxy := strings.TrimSpace(index[key]); proxy != "" {
+			return proxy
+		}
+	}
+	return ""
+}
+
+func authIndexKeys(a authFile) []string {
+	out := make([]string, 0, 8)
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		out = append(out, v)
+	}
+	add(a.Index)
+	add(a.ID)
+	add(a.Name)
+	if a.Name != "" {
+		add(strings.TrimSuffix(a.Name, ".json"))
+	}
+	add(a.Email)
+	if a.Email != "" {
+		add("xai-" + a.Email + ".json")
+	}
+	add(a.Path)
+	if a.Path != "" {
+		add(filepath.Base(a.Path))
+	}
+	return out
 }
 
 // patchAuthListCacheAfterSave updates one entry after host.auth.save so migrate
@@ -171,29 +287,35 @@ func patchAuthListCacheAfterSave(name string, obj map[string]any) {
 	email, _ := obj["email"].(string)
 
 	authListMu.Lock()
-	defer authListMu.Unlock()
-	if authListCache == nil {
-		return
+	var keys []string
+	if authListCache != nil {
+		for i := range authListCache {
+			a := &authListCache[i]
+			if a.Name != name && a.Index != name && a.ID != name {
+				continue
+			}
+			a.ProxyURL = proxy
+			a.Disabled = disabled
+			a.Raw = obj
+			if email != "" {
+				a.Email = email
+			}
+			keys = authIndexKeys(*a)
+			break
+		}
 	}
-	for i := range authListCache {
-		a := &authListCache[i]
-		if a.Name != name && a.Index != name && a.ID != name {
-			continue
+	authListMu.Unlock()
+	if store != nil {
+		if len(keys) == 0 {
+			keys = []string{name}
 		}
-		a.ProxyURL = proxy
-		a.Disabled = disabled
-		a.Raw = obj
-		if email != "" {
-			a.Email = email
-		}
-		return
+		store.patchAuthProxyKeys(keys, proxy)
 	}
 }
 
 func getAuthFile(authIndex string) (authFile, error) {
 	raw, err := hostCall(pluginabi.MethodHostAuthGet, mustJSON(map[string]any{"auth_index": authIndex}))
 	if err != nil {
-		// try name field
 		raw, err = hostCall(pluginabi.MethodHostAuthGet, mustJSON(map[string]any{"name": authIndex}))
 		if err != nil {
 			return authFile{}, err
@@ -246,13 +368,17 @@ func saveAuthFile(name string, obj map[string]any) error {
 	}))
 	if err == nil {
 		patchAuthListCacheAfterSave(name, obj)
-		// Rebuild proxy map from the patched list cache (no host round-trips).
 		invalidateAuthProxyCache()
 	}
 	return err
 }
 
 func setAuthProxyAndFlags(a authFile, proxyURL string, disabled bool, reason string) error {
+	full, err := hydrateAuthFile(a)
+	if err != nil {
+		return err
+	}
+	a = full
 	if a.Raw == nil {
 		a.Raw = map[string]any{}
 	}
@@ -269,11 +395,40 @@ func setAuthProxyAndFlags(a authFile, proxyURL string, disabled bool, reason str
 		delete(a.Raw, "disabled_reason")
 		delete(a.Raw, "disabled_at")
 	}
-	// ensure type
 	if _, ok := a.Raw["type"]; !ok {
 		a.Raw["type"] = "xai"
 	}
 	return saveAuthFile(a.Name, a.Raw)
+}
+
+func hydrateAuthFile(a authFile) (authFile, error) {
+	if authRawHasSecret(a.Raw) {
+		return a, nil
+	}
+	key := firstNonEmpty(a.Index, a.Name, a.ID, filepath.Base(a.Path))
+	if key == "" {
+		return authFile{}, fmt.Errorf("账号缺少 auth index")
+	}
+	got, err := getAuthFile(key)
+	if err != nil {
+		return authFile{}, err
+	}
+	if got.ID == "" {
+		got.ID = a.ID
+	}
+	return got, nil
+}
+
+func authRawHasSecret(raw map[string]any) bool {
+	if raw == nil {
+		return false
+	}
+	for _, key := range []string{"access_token", "refresh_token", "token", "sso"} {
+		if v, _ := raw[key].(string); strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func isGuardDisabledAuth(a authFile) bool {
@@ -293,8 +448,6 @@ func verifyAuthBinding(a authFile, expectedProxy string, expectedDisabled bool) 
 	if err == nil && got.ProxyURL == expectedProxy && got.Disabled == expectedDisabled {
 		return nil
 	}
-	// A host may regenerate the runtime auth index after host.auth.save. Verify
-	// by stable name/path with single gets — never re-list the whole auth pool.
 	for _, candidate := range []string{a.Name, filepath.Base(a.Path), a.Index, a.ID} {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" || candidate == key {
@@ -320,13 +473,11 @@ func listAuthFilesBestEffort() []authFile {
 }
 
 func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
-	// Fresh list so operator-driven rebalance sees latest CPA auth files.
 	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return nil, err
 	}
 	nodes := store.listNodes()
-	// eligible nodes: enabled, not guard-quarantined, has proxy
 	eligible := make([]*nodeRecord, 0)
 	for _, n := range nodes {
 		if n.Enabled && !n.DisabledByGuard && n.ProxyURL != "" {
@@ -335,15 +486,12 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 	}
 	counts := map[string]int{}
 	if len(eligible) == 0 {
-		// clear proxies? keep as-is but zero counts
 		store.setAssignedCounts(counts)
 		return counts, fmt.Errorf("没有可调度出口节点")
 	}
-	// only rebalance non-disabled auths; disabled stay put
 	active := make([]authFile, 0)
 	for _, a := range auths {
 		if a.Disabled {
-			// still count if matches a node proxy
 			for _, n := range nodes {
 				if a.ProxyURL != "" && a.ProxyURL == n.ProxyURL {
 					counts[n.ID]++
@@ -353,10 +501,8 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 		}
 		active = append(active, a)
 	}
-	// capacity-aware round robin
 	cursor := 0
 	for _, a := range active {
-		// pick next node with capacity room
 		var chosen *nodeRecord
 		for tried := 0; tried < len(eligible); tried++ {
 			n := eligible[cursor%len(eligible)]
@@ -369,7 +515,6 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 			break
 		}
 		if chosen == nil {
-			// all full — pile on last eligible
 			chosen = eligible[len(eligible)-1]
 		}
 		if a.ProxyURL == chosen.ProxyURL && !a.Disabled {
@@ -467,22 +612,12 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	var primary, fallback, expired []authFile
+	var primary, fallback []authFile
 	for _, a := range auths {
 		if a.Disabled {
 			continue
 		}
-		tok, _ := a.Raw["access_token"].(string)
-		if strings.TrimSpace(tok) == "" {
-			continue
-		}
 		onNode := node != nil && node.ProxyURL != "" && a.ProxyURL == node.ProxyURL
-		if isAuthExpired(a) {
-			if onNode {
-				expired = append(expired, a)
-			}
-			continue
-		}
 		if onNode {
 			primary = append(primary, a)
 		} else {
@@ -490,17 +625,28 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 		}
 	}
 	out := make([]authFile, 0, limit)
-	out = append(out, primary...)
-	// If node has no fresh bound auth, still try expired bound ones before foreign auths
-	// so quality probe still pins to the channel when possible.
-	if len(out) == 0 {
-		out = append(out, expired...)
+	appendHydrated := func(src []authFile) {
+		for _, a := range src {
+			if len(out) >= limit {
+				return
+			}
+			full, err := hydrateAuthFile(a)
+			if err != nil {
+				continue
+			}
+			tok, _ := full.Raw["access_token"].(string)
+			if strings.TrimSpace(tok) == "" {
+				continue
+			}
+			if isAuthExpired(full) && len(out) > 0 {
+				continue
+			}
+			out = append(out, full)
+		}
 	}
+	appendHydrated(primary)
 	if len(out) < limit {
-		out = append(out, fallback...)
-	}
-	if len(out) > limit {
-		out = out[:limit]
+		appendHydrated(fallback)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("没有可用的 CPA xAI 账号")
@@ -510,7 +656,6 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 
 // listBoundAuthSummaries returns lightweight account info for a node (no secrets).
 func listBoundAuthSummaries(node *nodeRecord) ([]map[string]any, error) {
-	// UI path: prefer fresh data so operators see post-rebalance bindings immediately.
 	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return nil, err
@@ -565,7 +710,6 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 	if bad == nil || bad.ProxyURL == "" {
 		return nil
 	}
-	// Force a fresh snapshot once; subsequent saves patch the cache in place.
 	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return err
@@ -579,7 +723,6 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 	if len(affected) == 0 {
 		return nil
 	}
-	// Remove every affected account from scheduling before changing its proxy.
 	for _, a := range affected {
 		if a.Disabled {
 			continue

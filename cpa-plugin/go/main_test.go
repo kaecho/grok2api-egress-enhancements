@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,7 +174,6 @@ func TestProbeUnstableErrDetection(t *testing.T) {
 		t.Fatalf("error text=%q", res.Error)
 	}
 }
-
 
 func TestDefaultPolicyThinkingFeaturesOn(t *testing.T) {
 	pol := defaultPolicy()
@@ -362,8 +362,6 @@ func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	}
 	endCrossVerify(node.ID)
 }
-
-
 
 func TestAuthDegradeCountsPassiveEvenWhenCrossVerifyScheduled(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
@@ -1099,5 +1097,121 @@ func TestBuiltinProfilesSeededAndCustomCRUD(t *testing.T) {
 	}
 	if store.policy().ActiveProfileID != profileThroughput {
 		t.Fatalf("delete active should fall back, got %s", store.policy().ActiveProfileID)
+	}
+}
+
+func TestNormalizeBareIPv6ProxyURL(t *testing.T) {
+	got, err := normalizeProxyURL("socks5h://user:pass@2001:470:ef3f::1:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "socks5h://user:pass@[2001:470:ef3f::1]:1080"
+	if got != want {
+		t.Fatalf("normalized=%q want %q", got, want)
+	}
+	if err := validateProxyURL(got); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateProxyURL("socks5h://emptysuns:emptysuns@111.119.237.235:1080"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTPClientAcceptsSOCKS5H(t *testing.T) {
+	for _, raw := range []string{
+		"socks5h://user:pass@111.119.237.235:1080",
+		"socks5h://user:pass@2001:470:ef3f::1:1080",
+		"socks5h://user:pass@[2001:470:ef3f::1]:1080",
+	} {
+		client, err := httpClientThroughProxy(raw, time.Second)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if client == nil || client.Transport == nil {
+			t.Fatalf("%s: empty client", raw)
+		}
+	}
+}
+
+func TestProbeConnectivityFallsBackToIPv6Endpoint(t *testing.T) {
+	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no ipv4", http.StatusBadGateway)
+	}))
+	defer fail.Close()
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("2001:470:ef3f::1"))
+	}))
+	defer ok.Close()
+
+	prev := connectivityProbeURLs
+	connectivityProbeURLs = []string{fail.URL, ok.URL}
+	t.Cleanup(func() { connectivityProbeURLs = prev })
+
+	ip, _, err := probeConnectivity("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip != "2001:470:ef3f::1" {
+		t.Fatalf("exit ip=%q", ip)
+	}
+}
+
+func TestAuthListFilePathAvoidsHostGet(t *testing.T) {
+	invalidateAuthListCache()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "xai-a.json")
+	body := []byte(`{"type":"xai","email":"a@example.test","access_token":"t","proxy_url":"socks5h://user:pass@111.119.237.235:1080","disabled":false}`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := map[string]int{}
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		calls[method]++
+		if method != pluginabi.MethodHostAuthList {
+			return nil, fmt.Errorf("unexpected %s", method)
+		}
+		return json.Marshal(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{{
+			ID: "a.json", AuthIndex: "a.json", Name: "a.json", Path: path, Provider: "xai", Type: "xai",
+		}}})
+	}
+	t.Cleanup(func() {
+		hostCall = original
+		invalidateAuthListCache()
+	})
+	got, err := listAuthFiles()
+	if err != nil || len(got) != 1 {
+		t.Fatalf("list n=%d err=%v", len(got), err)
+	}
+	if got[0].ProxyURL != "socks5h://user:pass@111.119.237.235:1080" {
+		t.Fatalf("proxy=%q", got[0].ProxyURL)
+	}
+	if calls[pluginabi.MethodHostAuthGet] != 0 {
+		t.Fatalf("file-backed list must not host.auth.get, got %d", calls[pluginabi.MethodHostAuthGet])
+	}
+}
+
+func TestDispatchNodesListDoesNotSweepAuth(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	_, _ = store.createNode("a", "socks5h://user:pass@111.119.237.235:1080", true, false, 0)
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		t.Fatalf("GET /nodes must not call host, got %s", method)
+		return nil, fmt.Errorf("unexpected %s", method)
+	}
+	t.Cleanup(func() { hostCall = original })
+	headers := make(http.Header)
+	headers.Set("X-Grok2API-Egress-UI", "1")
+	body, _ := json.Marshal(uiProxyRequest{Method: http.MethodGet, Path: "/nodes"})
+	raw, err := handleUIProxy(managementRequest{Method: http.MethodPost, Headers: headers, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(raw, &env)
+	var resp managementResponse
+	_ = json.Unmarshal(env.Result, &resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d %s", resp.StatusCode, resp.Body)
 	}
 }
