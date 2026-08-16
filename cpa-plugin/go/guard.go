@@ -946,6 +946,21 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		cvReason      string
 	)
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
+		if res.Classification == "ignored" {
+			n.LastSource = source
+			n.LastObservedAt = now
+			if source == "active" {
+				n.LastProbeAt = now
+			}
+			if res.ExitIP != "" {
+				n.ExitIP = res.ExitIP
+			}
+			if res.Error != "" {
+				n.LastReason = res.Error
+			}
+			nodeCopy = *n
+			return nil
+		}
 		n.LastClassification = res.Classification
 		n.LastOutputTPS = res.TPS
 		n.LastFirstTokenMs = res.FirstTokenMs
@@ -1253,7 +1268,9 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		return
 	}
 	provider := strings.ToLower(firstString(record, "Provider", "provider"))
-	if provider != "" && !strings.Contains(provider, "xai") && !strings.Contains(provider, "grok") {
+	authType := strings.ToLower(firstString(record, "AuthType", "auth_type", "AuthType"))
+	model := strings.ToLower(firstString(record, "Model", "model", "Alias", "alias"))
+	if !looksLikeXAIUsage(provider, authType, model) {
 		return
 	}
 	authID := firstString(record, "AuthID", "auth_id", "authId", "AuthIndex", "auth_index")
@@ -1336,6 +1353,9 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	}
 	nodeID := resolveNodeIDForAuth(store, authID, authIndex,
 		filepath.Base(authID), strings.TrimSuffix(filepath.Base(authID), ".json"))
+	if nodeID == "" {
+		nodeID = fallbackNodeIDForUnboundAuth(store)
+	}
 	authKey := firstNonEmpty(authID, authIndex)
 	res := qualityResult{
 		Classification: class,
@@ -1393,6 +1413,42 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// fallbackNodeIDForUnboundAuth maps account traffic that has no proxy_url onto
+// the only enabled egress. Multi-node deployments stay unmapped.
+func fallbackNodeIDForUnboundAuth(store *stateStore) string {
+	if store == nil {
+		return ""
+	}
+	var only *nodeRecord
+	for _, n := range store.listNodes() {
+		if n == nil || !n.Enabled || n.ProxyURL == "" {
+			continue
+		}
+		if only != nil {
+			return ""
+		}
+		only = n
+	}
+	if only == nil {
+		return ""
+	}
+	return only.ID
+}
+
+func looksLikeXAIUsage(provider, authType, model string) bool {
+	for _, v := range []string{provider, authType, model} {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			continue
+		}
+		if strings.Contains(v, "xai") || strings.Contains(v, "grok") {
+			return true
+		}
+	}
+	// Empty provider/model still reaches the plugin for xAI-only deployments.
+	return provider == "" && authType == ""
 }
 
 func busiestEnabledNode(store *stateStore) string {

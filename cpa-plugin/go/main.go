@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.10"
+	pluginVersion       = "1.0.11"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -756,6 +756,25 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				return managementJSON(http.StatusBadRequest, errMsg("listFailed", err.Error()))
 			}
 			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
+		}
+
+	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && parts[2] == "assign":
+		if method == http.MethodPost {
+			var raw map[string]any
+			_ = json.Unmarshal(body, &raw)
+			count := intPick(raw, -1, "count", "accountCount", "account_count")
+			if count < 0 {
+				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "请提供绑定数量 count"))
+			}
+			result, err := assignAuthsToNode(store, parts[1], count)
+			if err != nil && result.Bound == 0 && result.Added == 0 && result.Removed == 0 {
+				return managementJSON(http.StatusBadRequest, errMsg("assignFailed", err.Error()))
+			}
+			payload := map[string]any{"ok": err == nil, "data": result, "bound": result.Bound, "added": result.Added, "removed": result.Removed, "target": result.Target}
+			if err != nil {
+				payload["warning"] = err.Error()
+			}
+			return managementJSON(http.StatusOK, payload)
 		}
 
 	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "quality-test" || parts[2] == "quality"):

@@ -1100,6 +1100,172 @@ func TestBuiltinProfilesSeededAndCustomCRUD(t *testing.T) {
 	}
 }
 
+func TestFallbackNodeIDForUnboundAuth(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	only, err := store.createNode("only", "socks5h://u:p@127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fallbackNodeIDForUnboundAuth(store); got != only.ID {
+		t.Fatalf("single node fallback=%q want %q", got, only.ID)
+	}
+	if _, err := store.createNode("two", "socks5h://u:p@127.0.0.1:1081", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := fallbackNodeIDForUnboundAuth(store); got != "" {
+		t.Fatalf("two enabled nodes must stay unmapped, got %q", got)
+	}
+}
+
+func TestUnboundPassiveUsageMapsToSingleNode(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	node, err := store.createNode("ipv6", "socks5h://u:p@146.56.100.15:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidateAuthListCache()
+	invalidateAuthProxyCache()
+	handlePassiveUsage(store, map[string]any{
+		"Provider": "xai",
+		"AuthID":   "xai-user.json",
+		"Detail":   map[string]any{"OutputTokens": int64(80), "ReasoningTokens": int64(20)},
+		"Latency":  float64(2500 * 1e6),
+		"TTFT":     float64(400 * 1e6),
+	})
+	got, ok := store.getNode(node.ID)
+	if !ok || got.LastClassification != "healthy" || got.LastSource != "passive" {
+		t.Fatalf("unbound usage node=%+v", got)
+	}
+}
+
+func TestIgnoredObservationDoesNotClearHealthy(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	node, err := store.createNode("ipv6", "socks5h://u:p@146.56.100.15:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(n *nodeRecord) error {
+		n.LastClassification = "healthy"
+		n.LastOutputTPS = 34
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	applyObservation(store, node.ID, "active", qualityResult{
+		Classification: "ignored",
+		ErrorKind:      "no_account",
+		Error:          "没有可用的 CPA xAI 账号",
+	})
+	got, _ := store.getNode(node.ID)
+	if got.LastClassification != "healthy" {
+		t.Fatalf("ignored overwrote class=%q", got.LastClassification)
+	}
+	if got.LastReason != "没有可用的 CPA xAI 账号" {
+		t.Fatalf("reason=%q", got.LastReason)
+	}
+}
+
+func TestRenderStatusPageShowsConnectivityBadge(t *testing.T) {
+	html := renderPageHTML()
+	if !strings.Contains(html, "连通正常") {
+		t.Fatal("missing connectivity badge")
+	}
+	if !strings.Contains(html, "一键绑定账号") || !strings.Contains(html, "/assign") {
+		t.Fatal("missing bind-count UI")
+	}
+}
+
+func TestAssignAuthsToNodeBindsRequestedCount(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	node, err := store.createNode("ipv6", "socks5h://u:p@146.56.100.15:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"a.json": {"type": "xai", "email": "a@example.test", "access_token": "t", "disabled": false},
+		"b.json": {"type": "xai", "email": "b@example.test", "access_token": "t", "disabled": false},
+		"c.json": {"type": "xai", "email": "c@example.test", "access_token": "t", "disabled": false},
+		"d.json": {"type": "xai", "email": "d@example.test", "access_token": "t", "disabled": true},
+	}
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("missing %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected %s", method)
+		}
+	}
+	t.Cleanup(func() {
+		hostCall = original
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	invalidateAuthListCache()
+
+	got, err := assignAuthsToNode(store, node.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Bound != 2 || got.Added != 2 {
+		t.Fatalf("assign=%+v", got)
+	}
+	bound := 0
+	for _, raw := range auths {
+		if disabled, _ := raw["disabled"].(bool); disabled {
+			if raw["proxy_url"] != nil {
+				t.Fatal("disabled auth must stay unbound")
+			}
+			continue
+		}
+		if raw["proxy_url"] == node.ProxyURL {
+			bound++
+		}
+	}
+	if bound != 2 {
+		t.Fatalf("bound files=%d", bound)
+	}
+
+	got, err = assignAuthsToNode(store, node.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Bound != 0 || got.Removed != 2 {
+		t.Fatalf("unbind all=%+v", got)
+	}
+}
 func TestNormalizeBareIPv6ProxyURL(t *testing.T) {
 	got, err := normalizeProxyURL("socks5h://user:pass@2001:470:ef3f::1:1080")
 	if err != nil {

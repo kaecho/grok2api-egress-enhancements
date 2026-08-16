@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.10** |
+| 当前版本 | **1.0.11** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -386,6 +386,13 @@ v1.0.10 起：
 - 管理页 `GET /nodes` / `/status` 不再同步扫 `host.auth.get`；账号绑定从磁盘 `proxy_url` + 持久化索引读取
 - 连通探测依次打 `api64.ipify.org` / `api6.ipify.org` / `api.ipify.org`，纯 IPv6 SOCKS 出口不再因 `host unreachable` 误报
 - `socks5h://` 走 CPA `proxyutil` SOCKS 拨号；未加括号的 IPv6 代理 URL（`user:pass@2001:db8::1:1080`）会自动补 `[]`
+
+v1.0.11 起：
+
+- 未写 `proxy_url` 的账号，在只有一个启用节点时仍计入该出口的被动观测
+- 账号/额度/`没有可用账号` 不再把节点从「健康」打回「待检测」
+- 质量探测从磁盘读取完整 auth JSON，不再因为 Host get 失败找不到 token
+- 节点行「绑定」可按数量一键写入账号 `proxy_url`：优先未绑定账号，不足再从其他节点抽调
 
 v1.0.8 起额外修复商店安装后一直「未生效 / 未注册」：
 

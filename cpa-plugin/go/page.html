@@ -385,6 +385,17 @@
       <div class="modal-actions"><button class="button" type="button" data-close="accounts-modal">关闭</button></div>
     </section>
   </div>
+  <div id="bind-modal" class="modal-layer" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="bind-modal-title">
+      <div class="modal-head"><div><h3 id="bind-modal-title">一键绑定账号</h3><p id="bind-modal-sub">按数量写入账号 proxy_url，无需手动改认证文件</p></div><button class="button icon ghost" type="button" data-close="bind-modal" aria-label="关闭">×</button></div>
+      <form id="bind-form">
+        <div class="modal-body form-grid">
+          <div class="field full"><label for="bind-count">绑定数量</label><input id="bind-count" type="number" min="0" max="100000" required><p id="bind-count-help" class="help">优先使用未绑定账号；不足再从其他节点抽调。多于当前绑定时会解绑多余账号。</p></div>
+  </div>
+        <div class="modal-actions"><button class="button" type="button" data-close="bind-modal">取消</button><button id="save-bind" class="button primary" type="submit">绑定</button></div>
+      </form>
+    </section>
+  </div>
   <div id="confirm-modal" class="modal-layer" hidden>
     <section class="modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
       <div class="modal-head"><div><h3 id="confirm-title">确认操作</h3><p id="confirm-message"></p></div></div>
@@ -587,6 +598,8 @@
       if (guard.error_strikes) return '<span class="badge warn">检测失败</span>';
       if (guard.last_classification === 'hard' || guard.last_classification === 'soft') return '<span class="badge warn">可疑</span>';
       if (guard.last_classification === 'healthy') return '<span class="badge good">健康</span>';
+      if (node.probeStatus === 'ok' && node.exitIp) return '<span class="badge good">连通正常</span>';
+      if (node.probeStatus === 'error') return '<span class="badge warn">连通失败</span>';
       return '<span class="badge muted">待检测</span>';
     }
     function quarantineCountdown(guard) {
@@ -614,6 +627,7 @@
         '<button class="button" type="button" data-action="quality" title="真实模型质量检测">质量</button>' +
         '<button class="button" type="button" data-action="connectivity" title="检查代理连通性">连通</button>' +
         '<button class="button ghost" type="button" data-action="accounts" title="查看绑定账号">账号</button>' +
+        '<button class="button ghost" type="button" data-action="bind" title="一键绑定指定数量账号">绑定</button>' +
         '<button class="button ghost" type="button" data-action="edit">编辑</button>' +
         '<button class="button ghost" type="button" data-action="toggle">' + (node.enabled ? '停用' : '启用') + '</button>' +
         '<button class="button danger" type="button" data-action="delete">删除</button>' +
@@ -877,8 +891,36 @@
         toast(node.name + '：' + (data.classification || '-') + ' · ' + Number(data.tps || 0).toFixed(1) + ' Token/s' + marker);
         await load(true);
       } catch (error) { toast(error.message, 'error'); }
-      finally { busy(button, false); }
+     } finally { busy(button, false); }
     }
+    function openBind(node) {
+      state.binding = node;
+      $('bind-modal-title').textContent = node.name + ' · 一键绑定';
+      const cap = Number(node.accountCapacity || 0);
+      const current = Number(node.assignedAccountCount || 0);
+      $('bind-count').value = String(current || (cap || 10));
+      $('bind-count').max = String(cap > 0 ? cap : 100000);
+      $('bind-count-help').textContent = '当前已绑定 ' + current + (cap ? ' / 容量 ' + cap : '') + '。优先使用未绑定账号；不足再从其他节点抽调。设为 0 会解绑该节点上所有启用账号。';
+      openModal('bind-modal');
+    }
+    $('bind-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const node = state.binding;
+      if (!node) return;
+      const count = Number($('bind-count').value);
+      if (!Number.isInteger(count) || count < 0 || count > 100000) { toast('请输入 0 到 100000 的整数', 'error'); return; }
+      const button = $('save-bind');
+      busy(button, true);
+      try {
+        const result = await api('/nodes/' + encodeURIComponent(node.id) + '/assign', {method:'POST', body:{count}});
+        const data = result.data || result;
+        const summary = node.name + '：已绑定 ' + number(data.bound || 0) + ' 个（新增 ' + number(data.added || 0) + ' · 解绑 ' + number(data.removed || 0) + '）';
+        toast(result.warning ? (result.warning + ' · ' + summary) : summary, result.warning ? 'error' : 'success');
+        closeModal('bind-modal');
+        await load(true);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    });
     $('refresh-button').addEventListener('click', () => load());
     $('theme-button').addEventListener('click', () => {
       const dark = document.documentElement.dataset.theme === 'dark';
@@ -967,6 +1009,7 @@
       if (action === 'connectivity') testConnectivity([node.id], control);
       if (action === 'quality') qualityTest(node, control);
       if (action === 'accounts') showAccounts(node, control);
+      if (action === 'bind') openBind(node);
       if (action === 'delete') confirmAction('删除节点', '将删除“' + node.name + '”。已绑定账号会失去该出口分配。', (button) => deleteNodes([node.id], button));
     }
     $('nodes-body').addEventListener('click', handleNodeAction);
@@ -1065,7 +1108,7 @@
       if (tab && tab.dataset.panel) setPanel(tab.dataset.panel);
     });
     $('confirm-action').addEventListener('click', () => { if (state.confirm) state.confirm($('confirm-action')); });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','bulk-node-modal','policy-modal','profile-modal','confirm-modal','accounts-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','bulk-node-modal','policy-modal','profile-modal','confirm-modal','accounts-modal','bind-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
     const savedTheme = localStorage.getItem('grok2api-egress-theme');
     document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     $('panel-btn-nodes').addEventListener('click', () => setPanel('nodes'));

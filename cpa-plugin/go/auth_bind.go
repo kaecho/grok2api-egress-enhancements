@@ -189,13 +189,16 @@ func authFileFromListEntry(f pluginapi.HostAuthFileEntry, index map[string]strin
 	if email != "" {
 		a.Raw["email"] = email
 	}
-	if proxy, diskEmail, diskDisabled, ok := peekAuthBindingOnDisk(a.Path); ok {
-		a.ProxyURL = proxy
-		a.Disabled = diskDisabled
-		a.Raw["disabled"] = diskDisabled
-		if diskEmail != "" {
+	if disk, ok := readAuthJSONOnDisk(a.Path); ok {
+		a.Raw = disk
+		if proxy, _ := disk["proxy_url"].(string); strings.TrimSpace(proxy) != "" {
+			a.ProxyURL = strings.TrimSpace(proxy)
+		}
+		if diskEmail, _ := disk["email"].(string); diskEmail != "" {
 			a.Email = diskEmail
-			a.Raw["email"] = diskEmail
+		}
+		if disabled, exists := disk["disabled"].(bool); exists {
+			a.Disabled = disabled
 		}
 	} else if proxy := lookupAuthProxy(index, a); proxy != "" {
 		a.ProxyURL = proxy
@@ -218,23 +221,20 @@ func authFileFromListEntry(f pluginapi.HostAuthFileEntry, index map[string]strin
 	return a, true
 }
 
-func peekAuthBindingOnDisk(path string) (proxy, email string, disabled, ok bool) {
+func readAuthJSONOnDisk(path string) (map[string]any, bool) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return "", "", false, false
+		return nil, false
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil || len(raw) == 0 {
-		return "", "", false, false
+		return nil, false
 	}
 	var obj map[string]any
-	if json.Unmarshal(raw, &obj) != nil {
-		return "", "", false, false
+	if json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return nil, false
 	}
-	proxy, _ = obj["proxy_url"].(string)
-	email, _ = obj["email"].(string)
-	disabled, _ = obj["disabled"].(bool)
-	return strings.TrimSpace(proxy), strings.TrimSpace(email), disabled, true
+	return obj, true
 }
 
 func lookupAuthProxy(index map[string]string, a authFile) string {
@@ -405,6 +405,18 @@ func hydrateAuthFile(a authFile) (authFile, error) {
 	if authRawHasSecret(a.Raw) {
 		return a, nil
 	}
+	if disk, ok := readAuthJSONOnDisk(firstNonEmpty(a.Path, a.Name)); ok {
+		a.Raw = disk
+		if proxy, _ := disk["proxy_url"].(string); strings.TrimSpace(proxy) != "" {
+			a.ProxyURL = strings.TrimSpace(proxy)
+		}
+		if email, _ := disk["email"].(string); email != "" {
+			a.Email = email
+		}
+		if authRawHasSecret(a.Raw) {
+			return a, nil
+		}
+	}
 	key := firstNonEmpty(a.Index, a.Name, a.ID, filepath.Base(a.Path))
 	if key == "" {
 		return authFile{}, fmt.Errorf("账号缺少 auth index")
@@ -531,6 +543,109 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 	}
 	store.setAssignedCounts(counts)
 	return counts, nil
+}
+
+type assignResult struct {
+	NodeID    string `json:"nodeId"`
+	Requested int    `json:"requested"`
+	Target    int    `json:"target"`
+	Bound     int    `json:"bound"`
+	Added     int    `json:"added"`
+	Removed   int    `json:"removed"`
+}
+
+// assignAuthsToNode sets this node's enabled-account count to target.
+// Extra bound accounts are unbound; missing slots take unbound first, then
+// other nodes. Disabled accounts are never moved.
+func assignAuthsToNode(store *stateStore, nodeID string, count int) (assignResult, error) {
+	out := assignResult{NodeID: nodeID, Requested: count}
+	if count < 0 {
+		return out, fmt.Errorf("绑定数量不能为负数")
+	}
+	if count > 100000 {
+		return out, fmt.Errorf("绑定数量不能超过 100000")
+	}
+	node, ok := store.getNode(nodeID)
+	if !ok {
+		return out, fmt.Errorf("节点不存在")
+	}
+	if strings.TrimSpace(node.ProxyURL) == "" {
+		return out, fmt.Errorf("节点没有代理 URL")
+	}
+	if !node.Enabled {
+		return out, fmt.Errorf("节点未启用")
+	}
+	if node.DisabledByGuard {
+		return out, fmt.Errorf("节点已被隔离，不能绑定账号")
+	}
+	target := count
+	if node.AccountCapacity > 0 && target > node.AccountCapacity {
+		target = node.AccountCapacity
+	}
+	out.Target = target
+
+	auths, err := listAuthFilesFresh()
+	if err != nil {
+		return out, err
+	}
+	onNode := make([]authFile, 0)
+	unbound := make([]authFile, 0)
+	other := make([]authFile, 0)
+	for _, a := range auths {
+		if a.Disabled {
+			continue
+		}
+		if a.ProxyURL == node.ProxyURL {
+			onNode = append(onNode, a)
+			continue
+		}
+		if strings.TrimSpace(a.ProxyURL) == "" {
+			unbound = append(unbound, a)
+			continue
+		}
+		other = append(other, a)
+	}
+
+	for len(onNode) > target {
+		a := onNode[len(onNode)-1]
+		onNode = onNode[:len(onNode)-1]
+		if err := setAuthProxyAndFlags(a, "", false, ""); err != nil {
+			refreshAssignedCounts(store)
+			return out, fmt.Errorf("解绑 %s 失败: %w", a.Name, err)
+		}
+		out.Removed++
+	}
+	take := func(src *[]authFile) error {
+		for len(onNode) < target && len(*src) > 0 {
+			a := (*src)[0]
+			*src = (*src)[1:]
+			if err := setAuthProxyAndFlags(a, node.ProxyURL, false, ""); err != nil {
+				return fmt.Errorf("绑定 %s 失败: %w", a.Name, err)
+			}
+			if err := verifyAuthBinding(a, node.ProxyURL, false); err != nil {
+				return fmt.Errorf("绑定 %s 校验失败: %w", a.Name, err)
+			}
+			onNode = append(onNode, a)
+			out.Added++
+		}
+		return nil
+	}
+	if err := take(&unbound); err != nil {
+		refreshAssignedCounts(store)
+		out.Bound = len(onNode)
+		return out, err
+	}
+	if err := take(&other); err != nil {
+		refreshAssignedCounts(store)
+		out.Bound = len(onNode)
+		return out, err
+	}
+	refreshAssignedCounts(store)
+	out.Bound = len(onNode)
+	if out.Bound < target {
+		return out, fmt.Errorf("可用账号不足：已绑定 %d / 目标 %d", out.Bound, target)
+	}
+	return out, nil
 }
 
 func refreshAssignedCounts(store *stateStore) {
