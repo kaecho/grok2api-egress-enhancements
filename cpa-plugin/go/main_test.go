@@ -1173,6 +1173,15 @@ func TestRenderStatusPageShowsConnectivityBadge(t *testing.T) {
 	if !strings.Contains(html, "一键绑定账号") || !strings.Contains(html, "/assign") {
 		t.Fatal("missing bind-count UI")
 	}
+	scriptStart := strings.Index(html, "(() => {")
+	scriptEnd := strings.LastIndex(html, "})();")
+	if scriptStart < 0 || scriptEnd <= scriptStart {
+		t.Fatal("page script wrapper missing")
+	}
+	script := html[scriptStart : scriptEnd+len("})();")]
+	if strings.Count(script, "{") != strings.Count(script, "}") {
+		t.Fatalf("page script brace mismatch {=%d }=%d", strings.Count(script, "{"), strings.Count(script, "}"))
+	}
 }
 
 func TestAssignAuthsToNodeBindsRequestedCount(t *testing.T) {

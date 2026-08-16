@@ -394,6 +394,8 @@ v1.0.11 起：
 - 质量探测从磁盘读取完整 auth JSON，不再因为 Host get 失败找不到 token
 - 节点行「绑定」可按数量一键写入账号 `proxy_url`：优先未绑定账号，不足再从其他节点抽调
 
+v1.0.12 修了管理页卡在「正在加载节点」：1.0.11 的绑定弹窗把 `qualityTest` 的 try/finally 写坏，整页 JS 无法执行。
+
 v1.0.8 起额外修复商店安装后一直「未生效 / 未注册」：
 
 - `plugin.register` / `reconfigure` **不再同步**调用 `host.auth.*`（绑定数改由 worker 延迟 3s 再对账）

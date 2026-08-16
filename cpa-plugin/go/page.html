@@ -391,7 +391,7 @@
       <form id="bind-form">
         <div class="modal-body form-grid">
           <div class="field full"><label for="bind-count">绑定数量</label><input id="bind-count" type="number" min="0" max="100000" required><p id="bind-count-help" class="help">优先使用未绑定账号；不足再从其他节点抽调。多于当前绑定时会解绑多余账号。</p></div>
-  </div>
+        </div>
         <div class="modal-actions"><button class="button" type="button" data-close="bind-modal">取消</button><button id="save-bind" class="button primary" type="submit">绑定</button></div>
       </form>
     </section>
@@ -891,7 +891,7 @@
         toast(node.name + '：' + (data.classification || '-') + ' · ' + Number(data.tps || 0).toFixed(1) + ' Token/s' + marker);
         await load(true);
       } catch (error) { toast(error.message, 'error'); }
-     } finally { busy(button, false); }
+      finally { busy(button, false); }
     }
     function openBind(node) {
       state.binding = node;
