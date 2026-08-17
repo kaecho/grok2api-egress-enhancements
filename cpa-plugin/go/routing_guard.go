@@ -288,13 +288,13 @@ func missingThinkingStreamDecision(req pluginapi.StreamChunkInterceptRequest, ke
 	if hasThinking {
 		return pluginapi.StreamChunkInterceptResponse{}
 	}
+	if streamChunkHasVisibleContent(req.Body) {
+		return pluginapi.StreamChunkInterceptResponse{DropChunk: true}
+	}
 	if streamLooksFinished(req.Body) {
 		rememberRequestHint(requestHint{DegradeBlocked: true}, keys...)
 		disableMissingThinkingFromIntercept(keys, streamChunkUsageTokens(req.Body))
-		return pluginapi.StreamChunkInterceptResponse{Body: missingThinkingSSEError()}
-	}
-	if streamChunkHasVisibleContent(req.Body) {
-		return pluginapi.StreamChunkInterceptResponse{DropChunk: true}
+		return pluginapi.StreamChunkInterceptResponse{Body: emptyOpenAIStreamDone()}
 	}
 	return pluginapi.StreamChunkInterceptResponse{}
 }
@@ -306,7 +306,7 @@ func missingThinkingResponseBody(body []byte, keys []string) ([]byte, bool) {
 	}
 	rememberRequestHint(requestHint{DegradeBlocked: true}, keys...)
 	disableMissingThinkingFromIntercept(keys, streamChunkUsageTokens(body))
-	return missingThinkingJSONError(), true
+	return emptyOpenAIResponse(), true
 }
 
 func disableMissingThinkingFromIntercept(keys []string, outputTokens int64) {
@@ -412,16 +412,21 @@ func streamChunkHasVisibleContent(body []byte) bool {
 	return thinkingFieldNonEmpty(raw["output_text"]) || thinkingFieldNonEmpty(raw["delta"])
 }
 
-func missingThinkingJSONError() []byte {
+func emptyOpenAIResponse() []byte {
 	body, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"type":    "egress_auth_degraded",
-			"message": "响应缺少 thinking_content（降智）",
+		"id":     "chatcmpl-egress-skip",
+		"object": "chat.completion",
+		"choices": []any{
+			map[string]any{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": ""},
+				"finish_reason": "stop",
+			},
 		},
 	})
 	return body
 }
 
-func missingThinkingSSEError() []byte {
-	return []byte("data: " + string(missingThinkingJSONError()) + "\n\ndata: [DONE]\n\n")
+func emptyOpenAIStreamDone() []byte {
+	return []byte("data: {\"id\":\"chatcmpl-egress-skip\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 }

@@ -1309,6 +1309,17 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		isActiveConfirm := source == "active" || source == "cross_verify"
 		needMissing := missingThinkingHit(res, pol)
 
+		if n.ProxyPool && (needMissing || res.Classification == "soft" || res.Classification == "hard") {
+			// Rotating pool IPs are not a sticky egress signal.
+			n.LastClassification = ""
+			n.LastReason = ""
+			if (needMissing || res.Classification == "hard") && pol.DisableAuthOnHard && strings.TrimSpace(res.AuthID) != "" {
+				disableAccount = true
+			}
+			nodeCopy = *n
+			return nil
+		}
+
 		switch {
 		case res.Classification == "healthy":
 			n.SoftStrikes = 0
@@ -1443,7 +1454,15 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	// Missing thinking is account-level 降智. Disable the observed auth even
 	// when node quarantine waits on cross-verify or min_healthy_nodes.
 	if disableAccount || (missingThinkingHit(res, pol) && doQuarantine) {
-		disableObservedAuth(store, res, missingThinkingReason(res))
+		why := missingThinkingReason(res)
+		if !missingThinkingHit(res, pol) {
+			if strings.TrimSpace(res.Error) != "" {
+				why = res.Error
+			} else {
+				why = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+			}
+		}
+		disableObservedAuth(store, res, why)
 	}
 	if res.Classification == "ignored" {
 		// Account, quota, upstream and no-account failures are not evidence that

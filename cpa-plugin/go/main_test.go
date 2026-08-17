@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -757,11 +758,14 @@ func TestMissingThinkingDisablesAuthWhileCrossVerifyDefersNode(t *testing.T) {
 	if got.DisabledByGuard {
 		t.Fatal("cross-verify must still defer node quarantine")
 	}
-	if got.LastClassification != "hard" || strings.Contains(got.LastReason, "交叉验证") {
-		t.Fatalf("missing thinking must stay hard without scheduling CV, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	if got.LastClassification == "soft" || strings.Contains(got.LastReason, "交叉验证") {
+		t.Fatalf("proxy-pool missing thinking must not mark the node, got class=%q reason=%q", got.LastClassification, got.LastReason)
 	}
 	if disabled, _ := auths["xai-florence.json"]["disabled"].(bool); !disabled {
 		t.Fatal("missing-thinking auth must be disabled before cross-verify finishes")
+	}
+	if note, _ := auths["xai-florence.json"]["note"].(string); note != "降智账号" {
+		t.Fatalf("disabled auth note=%q, want 降智账号", note)
 	}
 	if other, _ := auths["xai-other.json"]["disabled"].(bool); other {
 		t.Fatal("sibling accounts on the same node must stay enabled")
@@ -842,8 +846,11 @@ func TestStreamInterceptorDropsMissingThinkingContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = decodeInterceptEnvelope[pluginapi.StreamChunkInterceptResponse](t, raw)
-	if got.DropChunk || !strings.Contains(string(got.Body), "响应缺少 thinking_content（降智）") {
-		t.Fatalf("finished stream without thinking must return error, got %+v", got)
+	if strings.Contains(string(got.Body), "egress_auth_degraded") || strings.Contains(string(got.Body), "降智") {
+		t.Fatalf("finished stream must not forward a degrade error, got %+v", got)
+	}
+	if !got.DropChunk && !bytes.Contains(got.Body, []byte("[DONE]")) {
+		t.Fatalf("finished stream without thinking must drop or close cleanly, got %+v", got)
 	}
 }
 
@@ -876,8 +883,11 @@ func TestResponseInterceptorReplacesMissingThinkingBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := decodeInterceptEnvelope[pluginapi.ResponseInterceptResponse](t, raw)
-	if !strings.Contains(string(got.Body), "响应缺少 thinking_content（降智）") {
-		t.Fatalf("non-stream missing thinking must be replaced, got %s", got.Body)
+	if strings.Contains(string(got.Body), "egress_auth_degraded") || strings.Contains(string(got.Body), "降智") {
+		t.Fatalf("non-stream missing thinking must not return degrade error, got %s", got.Body)
+	}
+	if !strings.Contains(string(got.Body), `"content":""`) {
+		t.Fatalf("non-stream missing thinking must be replaced with empty completion, got %s", got.Body)
 	}
 }
 
@@ -1559,9 +1569,116 @@ func TestSingleNodeHardDisablesObservedAuth(t *testing.T) {
 	if !disabled {
 		t.Fatal("observed hard auth must be disabled even when node quarantine is suppressed")
 	}
+	if note, _ := auths["xai-florence.json"]["note"].(string); note != "降智账号" {
+		t.Fatalf("disabled auth note=%q, want 降智账号", note)
+	}
 	if other, _ := auths["xai-other.json"]["disabled"].(bool); other {
 		t.Fatal("sibling accounts on the same node must stay enabled")
 	}
+}
+
+func TestProxyPoolQualityDoesNotMarkNode(t *testing.T) {
+	prevStore := store
+	prevHost := hostCall
+	t.Cleanup(func() {
+		store = prevStore
+		hostCall = prevHost
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	fixed, err := store.createNode("fixed", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.createNode("pool", "http://127.0.0.1:7952", true, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.MinHealthyNodes = 1
+	pol.DisableAuthOnHard = true
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = true
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"xai-pool.json": {
+			"type": "xai", "email": "pool@example.test", "access_token": "tok",
+			"proxy_url": pool.ProxyURL, "disabled": false, "note": "bot flag",
+		},
+	}
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	invalidateAuthListCache()
+	applyObservation(store, pool.ID, "passive", qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   64,
+		TPS:            10,
+		AuthID:         "xai-pool.json",
+		AuthLabel:      "pool@example.test",
+		Error:          "响应缺少 thinking_content（降智）",
+	})
+	gotPool, _ := store.getNode(pool.ID)
+	if gotPool.DisabledByGuard || gotPool.LastClassification != "" || gotPool.LastReason != "" || gotPool.ThinkingStrikes != 0 {
+		t.Fatalf("proxy-pool node must stay unmarked, got class=%q reason=%q strikes=%d isolated=%v", gotPool.LastClassification, gotPool.LastReason, gotPool.ThinkingStrikes, gotPool.DisabledByGuard)
+	}
+	if disabled, _ := auths["xai-pool.json"]["disabled"].(bool); !disabled {
+		t.Fatal("observed pool auth must still be disabled")
+	}
+	if note, _ := auths["xai-pool.json"]["note"].(string); note != "降智账号" {
+		t.Fatalf("pool auth note=%q, want 降智账号", note)
+	}
+	gotFixed, _ := store.getNode(fixed.ID)
+	if gotFixed.DisabledByGuard || gotFixed.LastClassification != "" {
+		t.Fatalf("sibling fixed node must stay untouched, got %+v", gotFixed)
+	}
+	for _, ev := range store.events() {
+		if ev.Event == "thinking_cross_verify_scheduled" || ev.Event == "node_quarantined" {
+			t.Fatalf("proxy-pool quality hit must not schedule node action, got %s", ev.Event)
+		}
+	}
+	endCrossVerify(pool.ID)
 }
 
 func TestSchedulerSkipsGuardDisabledAuth(t *testing.T) {

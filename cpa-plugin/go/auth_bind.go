@@ -391,6 +391,9 @@ func setAuthProxyAndFlags(a authFile, proxyURL string, disabled bool, reason str
 	if disabled && reason != "" {
 		a.Raw["disabled_reason"] = reason
 		a.Raw["disabled_at"] = nowRFC3339()
+		if strings.Contains(reason, "账号降智") {
+			a.Raw["note"] = "降智账号"
+		}
 	} else {
 		delete(a.Raw, "disabled_reason")
 		delete(a.Raw, "disabled_at")
