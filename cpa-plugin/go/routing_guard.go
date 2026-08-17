@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -214,8 +215,9 @@ func handleStreamChunkIntercept(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("decode stream chunk intercept request: %w", err)
 	}
-	rememberStreamChunk(req.Body, req.ChunkIndex, interceptAuthKeys(req.Metadata, req.RequestID)...)
-	return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	keys := interceptAuthKeys(req.Metadata, req.RequestID)
+	rememberStreamChunk(req.Body, req.ChunkIndex, keys...)
+	return okEnvelope(missingThinkingStreamDecision(req, keys, req.Model, req.RequestedModel))
 }
 
 func handleResponseIntercept(request []byte) ([]byte, error) {
@@ -223,11 +225,203 @@ func handleResponseIntercept(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("decode response intercept request: %w", err)
 	}
-	if keys := interceptAuthKeys(req.Metadata, req.RequestID); len(keys) > 0 && len(req.Body) > 0 {
+	keys := interceptAuthKeys(req.Metadata, req.RequestID)
+	if len(keys) > 0 && len(req.Body) > 0 {
 		rememberRequestHint(requestHint{
 			StreamSeen:        true,
 			StreamHasThinking: streamChunkHasThinking(req.Body),
 		}, keys...)
 	}
+	if interceptLooksLikeXAI(keys, req.Model, req.RequestedModel) {
+		if body, blocked := missingThinkingResponseBody(req.Body, keys); blocked {
+			return okEnvelope(pluginapi.ResponseInterceptResponse{Body: body})
+		}
+	}
 	return okEnvelope(pluginapi.ResponseInterceptResponse{})
+}
+
+func interceptThinkingOn(hint requestHint, ok bool) bool {
+	if ok && hint.ThinkingKnown {
+		return hint.ThinkingRequested
+	}
+	return true
+}
+
+func missingThinkingShouldBlock(keys []string) (requestHint, bool) {
+	hint, ok := recentRequestHint(keys...)
+	if !interceptThinkingOn(hint, ok) || hint.Multimodal {
+		return hint, false
+	}
+	return hint, true
+}
+
+func interceptLooksLikeXAI(keys []string, models ...string) bool {
+	for _, model := range models {
+		if looksLikeXAIUsage("", "", model) {
+			return true
+		}
+	}
+	for _, key := range keys {
+		lower := strings.ToLower(key)
+		if strings.Contains(lower, "xai") || strings.Contains(lower, "grok") {
+			return true
+		}
+	}
+	return false
+}
+
+func missingThinkingStreamDecision(req pluginapi.StreamChunkInterceptRequest, keys []string, models ...string) pluginapi.StreamChunkInterceptResponse {
+	if !interceptLooksLikeXAI(keys, append(models, req.Model, req.RequestedModel)...) {
+		return pluginapi.StreamChunkInterceptResponse{}
+	}
+	if req.ChunkIndex < 0 || len(req.Body) == 0 {
+		return pluginapi.StreamChunkInterceptResponse{}
+	}
+	hint, watch := missingThinkingShouldBlock(keys)
+	if !watch {
+		return pluginapi.StreamChunkInterceptResponse{}
+	}
+	if hint.DegradeBlocked {
+		return pluginapi.StreamChunkInterceptResponse{DropChunk: true}
+	}
+	hasThinking := hint.StreamHasThinking || streamChunkHasThinking(req.Body)
+	if hasThinking {
+		return pluginapi.StreamChunkInterceptResponse{}
+	}
+	if streamLooksFinished(req.Body) {
+		rememberRequestHint(requestHint{DegradeBlocked: true}, keys...)
+		disableMissingThinkingFromIntercept(keys, streamChunkUsageTokens(req.Body))
+		return pluginapi.StreamChunkInterceptResponse{Body: missingThinkingSSEError()}
+	}
+	if streamChunkHasVisibleContent(req.Body) {
+		return pluginapi.StreamChunkInterceptResponse{DropChunk: true}
+	}
+	return pluginapi.StreamChunkInterceptResponse{}
+}
+
+func missingThinkingResponseBody(body []byte, keys []string) ([]byte, bool) {
+	hint, watch := missingThinkingShouldBlock(keys)
+	if !watch || hint.StreamHasThinking || streamChunkHasThinking(body) {
+		return nil, false
+	}
+	rememberRequestHint(requestHint{DegradeBlocked: true}, keys...)
+	disableMissingThinkingFromIntercept(keys, streamChunkUsageTokens(body))
+	return missingThinkingJSONError(), true
+}
+
+func disableMissingThinkingFromIntercept(keys []string, outputTokens int64) {
+	ensureStore()
+	if store == nil {
+		return
+	}
+	pol := store.policy()
+	if !pol.ThinkingGuard {
+		return
+	}
+	if outputTokens <= 0 || (pol.MinOutputTokens > 0 && outputTokens < pol.MinOutputTokens) {
+		return
+	}
+	authID := ""
+	if hint, ok := recentRequestHint(keys...); ok {
+		authID = hint.AuthKey
+	}
+	if authID == "" && len(keys) > 0 {
+		authID = keys[0]
+	}
+	disableObservedAuth(store, qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		AuthID:         authID,
+		AuthLabel:      authID,
+		OutputTokens:   outputTokens,
+		Error:          "响应缺少 thinking_content（降智）",
+	}, "响应缺少 thinking_content（降智）")
+}
+
+func streamLooksFinished(body []byte) bool {
+	if bytes.Contains(body, []byte("[DONE]")) {
+		return true
+	}
+	payload := sseJSONPayload(body)
+	if len(payload) == 0 {
+		return false
+	}
+	var raw map[string]any
+	if json.Unmarshal(payload, &raw) != nil {
+		return false
+	}
+	typ := strings.ToLower(firstString(raw, "type", "Type"))
+	if strings.Contains(typ, "completed") || strings.HasSuffix(typ, ".done") || typ == "response.completed" {
+		return true
+	}
+	if _, ok := raw["usage"]; ok {
+		return true
+	}
+	if choices, ok := raw["choices"].([]any); ok {
+		for _, c := range choices {
+			cm, _ := c.(map[string]any)
+			if cm == nil {
+				continue
+			}
+			if reason := firstString(cm, "finish_reason", "finishReason"); reason != "" && reason != "null" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func streamChunkUsageTokens(body []byte) int64 {
+	payload := sseJSONPayload(body)
+	if len(payload) == 0 {
+		return 0
+	}
+	var raw map[string]any
+	if json.Unmarshal(payload, &raw) != nil {
+		return 0
+	}
+	if usage, ok := raw["usage"].(map[string]any); ok {
+		return outputTokensFromUsage(usage)
+	}
+	return 0
+}
+
+func streamChunkHasVisibleContent(body []byte) bool {
+	payload := sseJSONPayload(body)
+	if len(payload) == 0 {
+		return bytes.Contains(bytes.TrimSpace(body), []byte("{"))
+	}
+	var raw map[string]any
+	if json.Unmarshal(payload, &raw) != nil {
+		return false
+	}
+	if choices, ok := raw["choices"].([]any); ok {
+		for _, c := range choices {
+			cm, _ := c.(map[string]any)
+			if cm == nil {
+				continue
+			}
+			if delta, ok := cm["delta"].(map[string]any); ok && thinkingFieldNonEmpty(delta["content"]) {
+				return true
+			}
+			if msg, ok := cm["message"].(map[string]any); ok && thinkingFieldNonEmpty(msg["content"]) {
+				return true
+			}
+		}
+	}
+	return thinkingFieldNonEmpty(raw["output_text"]) || thinkingFieldNonEmpty(raw["delta"])
+}
+
+func missingThinkingJSONError() []byte {
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"type":    "egress_auth_degraded",
+			"message": "响应缺少 thinking_content（降智）",
+		},
+	})
+	return body
+}
+
+func missingThinkingSSEError() []byte {
+	return []byte("data: " + string(missingThinkingJSONError()) + "\n\ndata: [DONE]\n\n")
 }

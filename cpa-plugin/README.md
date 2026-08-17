@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.16** |
+| 当前版本 | **1.0.17** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request / Response / Stream Interceptor |
@@ -403,6 +403,8 @@ v1.0.14：带图片的 Grok 4.6 请求不再被误判为「缺少 thinking」。
 v1.0.15：被动 usage 里没有 `reasoning_tokens` 不再当成「缺少 thinking」。CPA 的 xAI `/responses` 经常不带这个桶，TPS 正常也会被误报降智；主动探测走真实 SSE 所以交叉验证又回到 healthy。现在只在流/响应里亲眼见过输出、且没有 thinking 时才判缺 thinking；usage 只有 Token/s。
 
 v1.0.16：单节点 + `min_healthy_nodes=1` 时隔离仍会被抑制，但确认硬阈值 / 缺 thinking 后会停用**肇事账号**，不再把整个出口 1845 个账号一起陪葬。交叉验证优先复测同一账号；流里没有 thinking 字段时，usage 里的 `reasoning_tokens` 不再洗白。调度器 / 拦截器会跳过刚停用的账号。
+
+v1.0.17：缺 thinking 当场停账号，不再先交叉验证烧一轮 Token。开启 thinking 的请求若整段输出没有 thinking 字段，拦截器丢掉正文并回错误，不再把降智内容交给客户端。
 
 v1.0.8 起额外修复商店安装后一直「未生效 / 未注册」：
 

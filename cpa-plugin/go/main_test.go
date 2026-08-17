@@ -670,6 +670,263 @@ func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	endCrossVerify(node.ID)
 }
 
+func TestMissingThinkingDisablesAuthWhileCrossVerifyDefersNode(t *testing.T) {
+	prevStore := store
+	prevHost := hostCall
+	t.Cleanup(func() {
+		store = prevStore
+		hostCall = prevHost
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("ipv6", "http://127.0.0.1:7951", true, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.MinHealthyNodes = 1
+	pol.DisableAuthOnHard = true
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = true
+	pol.ConsecutiveMissingThinking = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"xai-florence.json": {
+			"type": "xai", "email": "florence@example.test", "access_token": "tok",
+			"proxy_url": node.ProxyURL, "disabled": false,
+		},
+		"xai-other.json": {
+			"type": "xai", "email": "other@example.test", "access_token": "tok2",
+			"proxy_url": node.ProxyURL, "disabled": false,
+		},
+	}
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	invalidateAuthListCache()
+	applyObservation(store, node.ID, "passive", qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   64,
+		TPS:            10,
+		AuthID:         "xai-florence.json",
+		AuthLabel:      "florence@example.test",
+		Error:          "响应缺少 thinking_content（降智）",
+	})
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("cross-verify must still defer node quarantine")
+	}
+	if got.LastClassification != "hard" || strings.Contains(got.LastReason, "交叉验证") {
+		t.Fatalf("missing thinking must stay hard without scheduling CV, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+	if disabled, _ := auths["xai-florence.json"]["disabled"].(bool); !disabled {
+		t.Fatal("missing-thinking auth must be disabled before cross-verify finishes")
+	}
+	if other, _ := auths["xai-other.json"]["disabled"].(bool); other {
+		t.Fatal("sibling accounts on the same node must stay enabled")
+	}
+	disabledEvent := false
+	for _, ev := range store.events() {
+		if ev.Event == "thinking_cross_verify_scheduled" {
+			t.Fatal("disabled missing-thinking auth must not spend a cross-verify probe")
+		}
+		if ev.Event == "account_disabled" && ev.AuthID == "xai-florence.json" {
+			disabledEvent = true
+		}
+	}
+	if !disabledEvent {
+		t.Fatal("expected account_disabled event for the observed auth")
+	}
+	endCrossVerify(node.ID)
+}
+
+func decodeInterceptEnvelope[T any](t *testing.T, raw []byte) T {
+	t.Helper()
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("envelope=%s err=%v", raw, err)
+	}
+	var out T
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestStreamInterceptorDropsMissingThinkingContent(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetRequestHints()
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	resetRequestHints()
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		RequestID: "req-block-think",
+		Metadata:  map[string]any{"selected_auth_id": "xai-florence.json"},
+		Body:      []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	rawChunk, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		RequestID:  "req-block-think",
+		Model:      "grok-4.6",
+		ChunkIndex: 0,
+		Body:       []byte(`data: {"choices":[{"delta":{"content":"8"}}]}`),
+	})
+	raw, err := handleStreamChunkIntercept(rawChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeInterceptEnvelope[pluginapi.StreamChunkInterceptResponse](t, raw)
+	if !got.DropChunk {
+		t.Fatalf("content without thinking must be dropped, got %+v", got)
+	}
+	rawDone, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		RequestID:  "req-block-think",
+		Model:      "grok-4.6",
+		ChunkIndex: 1,
+		Body:       []byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":80}}\n\ndata: [DONE]\n`),
+	})
+	raw, err = handleStreamChunkIntercept(rawDone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = decodeInterceptEnvelope[pluginapi.StreamChunkInterceptResponse](t, raw)
+	if got.DropChunk || !strings.Contains(string(got.Body), "响应缺少 thinking_content（降智）") {
+		t.Fatalf("finished stream without thinking must return error, got %+v", got)
+	}
+}
+
+func TestResponseInterceptorReplacesMissingThinkingBody(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetRequestHints()
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	resetRequestHints()
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		RequestID: "req-block-json",
+		Metadata:  map[string]any{"selected_auth_id": "xai-florence.json"},
+		Body:      []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	rawResp, _ := json.Marshal(pluginapi.ResponseInterceptRequest{
+		RequestID: "req-block-json",
+		Model:     "grok-4.6",
+		Metadata:  map[string]any{"selected_auth_id": "xai-florence.json"},
+		Body:      []byte(`{"choices":[{"message":{"content":"8"}}],"usage":{"completion_tokens":80}}`),
+	})
+	raw, err := handleResponseIntercept(rawResp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeInterceptEnvelope[pluginapi.ResponseInterceptResponse](t, raw)
+	if !strings.Contains(string(got.Body), "响应缺少 thinking_content（降智）") {
+		t.Fatalf("non-stream missing thinking must be replaced, got %s", got.Body)
+	}
+}
+
+func TestStreamInterceptorKeepsThinkingContent(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetRequestHints()
+	})
+	resetRequestHints()
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		RequestID: "req-keep-think",
+		Metadata:  map[string]any{"selected_auth_id": "xai-other.json"},
+		Body:      []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	rawThink, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		RequestID:  "req-keep-think",
+		Model:      "grok-4.6",
+		ChunkIndex: 0,
+		Body:       []byte(`data: {"choices":[{"delta":{"reasoning_content":"add the numbers"}}]}`),
+	})
+	raw, err := handleStreamChunkIntercept(rawThink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeInterceptEnvelope[pluginapi.StreamChunkInterceptResponse](t, raw)
+	if got.DropChunk || len(got.Body) > 0 {
+		t.Fatalf("thinking chunk must pass through, got %+v", got)
+	}
+	rawContent, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		RequestID:  "req-keep-think",
+		Model:      "grok-4.6",
+		ChunkIndex: 1,
+		Body:       []byte(`data: {"choices":[{"delta":{"content":"8"}}]}`),
+	})
+	raw, err = handleStreamChunkIntercept(rawContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = decodeInterceptEnvelope[pluginapi.StreamChunkInterceptResponse](t, raw)
+	if got.DropChunk {
+		t.Fatalf("content after thinking must pass through, got %+v", got)
+	}
+}
+
 func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)

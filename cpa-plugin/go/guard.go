@@ -69,10 +69,11 @@ type requestHint struct {
 	StreamSeen        bool
 	StreamHasThinking bool
 	AuthKey           string
+	DegradeBlocked    bool
 }
 
 func rememberRequestHint(hint requestHint, keys ...string) {
-	if !hint.Multimodal && !hint.ThinkingKnown && !hint.StreamSeen && strings.TrimSpace(hint.AuthKey) == "" {
+	if !hint.Multimodal && !hint.ThinkingKnown && !hint.StreamSeen && !hint.DegradeBlocked && strings.TrimSpace(hint.AuthKey) == "" {
 		return
 	}
 	hint.Until = time.Now().Add(multimodalUsageTTL)
@@ -96,6 +97,9 @@ func rememberRequestHint(hint requestHint, keys ...string) {
 		}
 		if hint.AuthKey != "" && prev.AuthKey == "" {
 			prev.AuthKey = hint.AuthKey
+		}
+		if hint.DegradeBlocked {
+			prev.DegradeBlocked = true
 		}
 		requestHintByAuth[key] = prev
 	}
@@ -420,7 +424,7 @@ func streamChunkHasThinking(body []byte) bool {
 	if json.Unmarshal(payload, &raw) != nil {
 		return false
 	}
-	if recordHasThinking(raw) {
+	if mapHasThinkingContent(raw) {
 		return true
 	}
 	typ := strings.ToLower(firstString(raw, "type", "Type"))
@@ -1244,6 +1248,13 @@ func missingThinkingHit(res qualityResult, pol policyConfig) bool {
 		res.ErrorKind != "probe_unstable"
 }
 
+func missingThinkingReason(res qualityResult) string {
+	if strings.TrimSpace(res.Error) != "" {
+		return res.Error
+	}
+	return "响应缺少 thinking_content（降智）"
+}
+
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
 	pol := store.policy()
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
@@ -1251,13 +1262,14 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	}
 	now := float64(time.Now().Unix())
 	var (
-		doRestore     bool
-		doQuarantine  bool
-		quarantineWhy string
-		nodeCopy      nodeRecord
-		scheduleCV    bool
-		cvEvent       string
-		cvReason      string
+		doRestore      bool
+		doQuarantine   bool
+		quarantineWhy  string
+		nodeCopy       nodeRecord
+		scheduleCV     bool
+		cvEvent        string
+		cvReason       string
+		disableAccount bool
 	)
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
 		if res.Classification == "ignored" {
@@ -1320,8 +1332,12 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 				n.LastClassification = "soft"
 				n.LastReason = fmt.Sprintf("连续缺少 thinking %d/%d", n.ThinkingStrikes, threshold)
 			} else if !n.DisabledByGuard {
-				// Reached threshold: either cross-verify (passive) or quarantine now.
-				if pol.ThinkingCrossVerify && !isActiveConfirm {
+				// Account-level 降智 does not wait on a node probe.
+				if pol.DisableAuthOnHard && strings.TrimSpace(res.AuthID) != "" {
+					n.LastClassification = "hard"
+					n.LastReason = missingThinkingReason(res)
+					disableAccount = true
+				} else if pol.ThinkingCrossVerify && !isActiveConfirm {
 					scheduleCV = true
 					cvEvent = "thinking_cross_verify_scheduled"
 					cvReason = fmt.Sprintf("连续缺少 thinking %d 次，触发交叉验证探测（可能延迟隔离并增加 Token 消耗）", n.ThinkingStrikes)
@@ -1424,6 +1440,11 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			store.recordAuthObservation(res.AuthID, res.AuthLabel, source, nodeCopy.ID, nodeCopy.Name, res.Classification, reason, res.TPS, degraded)
 		}
 	}
+	// Missing thinking is account-level 降智. Disable the observed auth even
+	// when node quarantine waits on cross-verify or min_healthy_nodes.
+	if disableAccount || (missingThinkingHit(res, pol) && doQuarantine) {
+		disableObservedAuth(store, res, missingThinkingReason(res))
+	}
 	if res.Classification == "ignored" {
 		// Account, quota, upstream and no-account failures are not evidence that
 		// the egress is degraded. Keep the observation for diagnostics, but never
@@ -1443,7 +1464,9 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		return
 	}
 	if doQuarantine {
-		disableObservedAuth(store, res, quarantineWhy)
+		if !missingThinkingHit(res, pol) {
+			disableObservedAuth(store, res, quarantineWhy)
+		}
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
@@ -1773,6 +1796,10 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 				}
 			}
 			store.recordAuthObservation(authKey, authKey, "passive", "", "", class, reason, tps, degraded)
+		}
+		if pol.ThinkingGuard && class == "hard" && !hasThinking && !failed {
+			disableObservedAuth(store, res, missingThinkingReason(res))
+			return
 		}
 		return
 	}

@@ -37,6 +37,7 @@ type policyConfig struct {
 	ConsecutiveMissingThinking int `json:"consecutive_missing_thinking"`
 	// ThinkingCrossVerify defers missing-thinking isolation until an active probe
 	// also lacks thinking. Default true. May delay isolation and spend probe tokens.
+	// Account disable on missing thinking does not wait for this probe.
 	ThinkingCrossVerify bool `json:"thinking_cross_verify"`
 	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms the
 	// anomaly. Default true.
