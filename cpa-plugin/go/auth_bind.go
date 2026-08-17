@@ -451,6 +451,115 @@ func isGuardDisabledAuth(a authFile) bool {
 	return strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智")
 }
 
+func isAccountQualityDisabled(a authFile) bool {
+	if !a.Disabled {
+		return false
+	}
+	reason, _ := a.Raw["disabled_reason"].(string)
+	return strings.Contains(reason, "账号降智")
+}
+
+func authMatchesKey(a authFile, key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	base := filepath.Base(key)
+	for _, k := range authIndexKeys(a) {
+		if k == key || k == base {
+			return true
+		}
+	}
+	return false
+}
+
+func preferAuths(auths []authFile, prefer string) []authFile {
+	prefer = strings.TrimSpace(prefer)
+	if prefer == "" || len(auths) < 2 {
+		return auths
+	}
+	head := make([]authFile, 0, 1)
+	rest := make([]authFile, 0, len(auths))
+	for _, a := range auths {
+		if authMatchesKey(a, prefer) {
+			head = append(head, a)
+			continue
+		}
+		rest = append(rest, a)
+	}
+	if len(head) == 0 {
+		return auths
+	}
+	return append(head, rest...)
+}
+
+func disableAuthByID(authID, reason string) error {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	a, ok := findAuthByID(authID)
+	if !ok {
+		return fmt.Errorf("账号不存在")
+	}
+	if a.Disabled {
+		return nil
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "egress-guard 降智隔离"
+	}
+	return setAuthProxyAndFlags(a, a.ProxyURL, true, reason)
+}
+
+func findAuthByID(authID string) (authFile, bool) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return authFile{}, false
+	}
+	auths, err := listAuthFiles()
+	if err != nil {
+		return authFile{}, false
+	}
+	for _, a := range auths {
+		if authMatchesKey(a, authID) {
+			return a, true
+		}
+	}
+	return authFile{}, false
+}
+
+func mergePreferredAuth(candidates []authFile, prefer string) []authFile {
+	prefer = strings.TrimSpace(prefer)
+	if prefer == "" {
+		return candidates
+	}
+	if a, ok := findAuthByID(prefer); ok && !a.Disabled {
+		if full, err := hydrateAuthFile(a); err == nil {
+			tok, _ := full.Raw["access_token"].(string)
+			if strings.TrimSpace(tok) != "" {
+				return preferAuths(append([]authFile{full}, candidates...), prefer)
+			}
+		}
+	}
+	return preferAuths(candidates, prefer)
+}
+
+func cachedAuthDisabled(authID string) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return false
+	}
+	authListMu.Lock()
+	warm := authListCache
+	authListMu.Unlock()
+	for _, a := range warm {
+		if a.Disabled && authMatchesKey(a, authID) {
+			return true
+		}
+	}
+	return false
+}
+
 func verifyAuthBinding(a authFile, expectedProxy string, expectedDisabled bool) error {
 	key := firstNonEmpty(a.Index, a.Name)
 	if key == "" {
@@ -696,11 +805,8 @@ func enableAuthsOnNode(node *nodeRecord) error {
 		return err
 	}
 	for _, a := range auths {
-		if a.ProxyURL == node.ProxyURL && a.Disabled {
-			reason, _ := a.Raw["disabled_reason"].(string)
-			if strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智") {
-				_ = setAuthProxyAndFlags(a, a.ProxyURL, false, "")
-			}
+		if a.ProxyURL == node.ProxyURL && isGuardDisabledAuth(a) && !isAccountQualityDisabled(a) {
+			_ = setAuthProxyAndFlags(a, a.ProxyURL, false, "")
 		}
 	}
 	return nil
@@ -831,7 +937,7 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 	}
 	affected := make([]authFile, 0)
 	for _, a := range auths {
-		if a.ProxyURL == bad.ProxyURL && (!a.Disabled || isGuardDisabledAuth(a)) {
+		if a.ProxyURL == bad.ProxyURL && !isAccountQualityDisabled(a) && (!a.Disabled || isGuardDisabledAuth(a)) {
 			affected = append(affected, a)
 		}
 	}

@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.15"
+	pluginVersion       = "1.0.16"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -128,12 +128,12 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	ManagementAPI      bool `json:"management_api"`
-	UsagePlugin        bool `json:"usage_plugin"`
-	Scheduler          bool `json:"scheduler"`
-	RequestInterceptor bool `json:"request_interceptor"`
-	ResponseInterceptor     bool `json:"response_interceptor"`
-	StreamChunkInterceptor  bool `json:"response_stream_interceptor"`
+	ManagementAPI          bool `json:"management_api"`
+	UsagePlugin            bool `json:"usage_plugin"`
+	Scheduler              bool `json:"scheduler"`
+	RequestInterceptor     bool `json:"request_interceptor"`
+	ResponseInterceptor    bool `json:"response_interceptor"`
+	StreamChunkInterceptor bool `json:"response_stream_interceptor"`
 }
 
 type managementRegistration struct {
@@ -792,7 +792,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "quality-test" || parts[2] == "quality"):
 		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[1], profileIDFrom(query, body))
+			r, err := runNodeQuality(store, parts[1], profileIDFrom(query, body), "")
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
 			}
@@ -800,7 +800,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		}
 	case len(parts) == 4 && parts[0] == "quality-guard" && parts[1] == "nodes" && safeID(parts[2]) && parts[3] == "test":
 		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[2], profileIDFrom(query, body))
+			r, err := runNodeQuality(store, parts[2], profileIDFrom(query, body), "")
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
 			}

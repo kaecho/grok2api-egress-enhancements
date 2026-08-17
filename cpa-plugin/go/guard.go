@@ -450,16 +450,6 @@ func streamChunkHasThinking(body []byte) bool {
 			}
 		}
 	}
-	if usage, ok := raw["usage"].(map[string]any); ok {
-		if firstInt(usage, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
-			return true
-		}
-		for _, nest := range []string{"completion_tokens_details", "output_tokens_details", "completionTokensDetails", "outputTokensDetails"} {
-			if details, ok := usage[nest].(map[string]any); ok && firstInt(details, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
-				return true
-			}
-		}
-	}
 	return false
 }
 
@@ -922,7 +912,7 @@ func authProbeLabel(auth authFile) string {
 	return auth.Index
 }
 
-func probeQuality(store *stateStore, node *nodeRecord, profileID string) qualityResult {
+func probeQuality(store *stateStore, node *nodeRecord, profileID, preferAuth string) qualityResult {
 	pol := store.policy()
 	profile := store.resolveProfile(profileID)
 	model := strings.TrimSpace(profile.Model)
@@ -943,7 +933,11 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 	}
 
 	candidates, err := listAuthsForNode(node, 8)
-	if err != nil || len(candidates) == 0 {
+	if err != nil {
+		candidates = nil
+	}
+	candidates = mergePreferredAuth(candidates, preferAuth)
+	if len(candidates) == 0 {
 		res.Classification = "error"
 		res.ErrorKind = "no_account"
 		if err != nil {
@@ -1080,9 +1074,6 @@ func probeQuality(store *stateStore, node *nodeRecord, profileID string) quality
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usageOut = maxInt64(usageOut, outputTokensFromUsage(u))
 				usageReason = maxInt64(usageReason, anyInt(u["reasoning_tokens"]), anyInt(u["reasoningTokens"]))
-				if usageReason > 0 {
-					hasThinking = true
-				}
 			}
 			choices, _ := chunk["choices"].([]any)
 			for _, c := range choices {
@@ -1239,7 +1230,7 @@ func scheduleCrossVerifyProbe(store *stateStore, nodeID, name, event, reason str
 	})
 	go func(id string) {
 		defer endCrossVerify(id)
-		if _, err := runNodeQuality(store, id, ""); err != nil {
+		if _, err := runNodeQuality(store, id, "", res.AuthID); err != nil {
 			log.Printf("cross-verify probe failed node=%s err=%v", id, err)
 		}
 	}(nodeID)
@@ -1452,9 +1443,44 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		return
 	}
 	if doQuarantine {
+		disableObservedAuth(store, res, quarantineWhy)
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
+}
+
+func disableObservedAuth(store *stateStore, res qualityResult, reason string) {
+	if store == nil || strings.TrimSpace(res.AuthID) == "" {
+		return
+	}
+	if !store.policy().DisableAuthOnHard {
+		return
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = res.Error
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "账号质量异常"
+	}
+	why := "egress-guard 账号降智: " + reason
+	if err := disableAuthByID(res.AuthID, why); err != nil {
+		store.appendEvent(guardEvent{
+			Event:     "account_disable_failed",
+			AuthID:    res.AuthID,
+			NodeName:  res.AuthLabel,
+			Reason:    err.Error(),
+			OutputTPS: res.TPS,
+		})
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:          "account_disabled",
+		AuthID:         res.AuthID,
+		NodeName:       res.AuthLabel,
+		Reason:         why,
+		Classification: res.Classification,
+		OutputTPS:      res.TPS,
+	})
 }
 
 func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string) {
@@ -1508,7 +1534,7 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 		// A newly rotated IP gets exactly one real-model confirmation before it
 		// can leave quarantine. A healthy result restores the node; anomalies keep
 		// it isolated for the normal recovery worker.
-		_, _ = runNodeQuality(store, updated.ID, "")
+		_, _ = runNodeQuality(store, updated.ID, "", "")
 	}
 }
 
@@ -1541,7 +1567,7 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 	return out, nil
 }
 
-func runNodeQuality(store *stateStore, id, profileID string) (map[string]any, error) {
+func runNodeQuality(store *stateStore, id, profileID, preferAuth string) (map[string]any, error) {
 	n, ok := store.getNode(id)
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
@@ -1549,7 +1575,7 @@ func runNodeQuality(store *stateStore, id, profileID string) (map[string]any, er
 	if n.DisabledByGuard && n.QuarantinedUntil > float64(time.Now().Unix()) {
 		// still allow manual quality test for recovery
 	}
-	res := probeQuality(store, n, profileID)
+	res := probeQuality(store, n, profileID, preferAuth)
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
@@ -1680,7 +1706,7 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 			thinkingOn = hint.ThinkingRequested
 		}
 		if thinkingOn {
-			if !hasThinking && hasHint && hint.StreamSeen {
+			if hasHint && hint.StreamSeen && !hint.Multimodal {
 				hasThinking = hint.StreamHasThinking
 			} else if !hasThinking {
 				// Usage omitted reasoning_tokens. Without a stream sample
@@ -1842,14 +1868,14 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				now := float64(time.Now().Unix())
 				for _, n := range store.listNodes() {
 					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = runNodeQuality(store, n.ID, "")
+						_, _ = runNodeQuality(store, n.ID, "", "")
 						continue
 					}
 					if pol.Mode == "active" || pol.Mode == "hybrid" {
 						// light active cadence per node via last probe
 						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
 							// don't stampede — one per tick
-							_, _ = runNodeQuality(store, n.ID, "")
+							_, _ = runNodeQuality(store, n.ID, "", "")
 							break
 						}
 					}

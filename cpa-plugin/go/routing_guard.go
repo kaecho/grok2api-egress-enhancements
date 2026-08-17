@@ -76,6 +76,11 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 			nonXAIAvailable = true
 			continue
 		}
+		if cachedAuthDisabled(candidate.ID) {
+			managed = true
+			filtered = true
+			continue
+		}
 		proxy := cache[candidate.ID]
 		if proxy == "" {
 			continue
@@ -139,6 +144,23 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 	}
 	if selected == "" {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	if cachedAuthDisabled(selected) {
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"type":    "egress_auth_disabled",
+				"message": "当前账号已被出口守护停用，请重试其他账号",
+			},
+		})
+		return okEnvelope(pluginapi.RequestInterceptResponse{
+			Terminate:  true,
+			StatusCode: http.StatusServiceUnavailable,
+			ResponseHeaders: http.Header{
+				"Content-Type": []string{"application/json"},
+				"Retry-After":  []string{"1"},
+			},
+			ResponseBody: body,
+		})
 	}
 	nodeID := resolveNodeIDForAuth(store, selected)
 	if nodeID == "" {

@@ -336,6 +336,62 @@ func TestStreamChunkHasThinkingAcceptsResponsesEvents(t *testing.T) {
 	}
 }
 
+func TestStreamChunkHasThinkingIgnoresUsageReasoningTokens(t *testing.T) {
+	if streamChunkHasThinking([]byte(`data: {"choices":[{"delta":{"content":"hi"}}],"usage":{"completion_tokens":169,"completion_tokens_details":{"reasoning_tokens":168}}}`)) {
+		t.Fatal("usage reasoning_tokens without thinking fields must not count as thinking")
+	}
+}
+
+func TestPassiveUsageStreamOverridesUsageReasoningTokens(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetRequestHints()
+		invalidateAuthProxyCache()
+	})
+	resetRequestHints()
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 0
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.createNode("ipv6", "socks5h://u:p@127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		RequestID: "req-think-usage",
+		Metadata:  map[string]any{"selected_auth_id": "xai-user.json"},
+		Body:      []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	rawChunk, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		RequestID:  "req-think-usage",
+		ChunkIndex: 0,
+		Body:       []byte(`data: {"choices":[{"delta":{"content":"hello"}}],"usage":{"completion_tokens_details":{"reasoning_tokens":168}}}`),
+	})
+	if _, err := handleStreamChunkIntercept(rawChunk); err != nil {
+		t.Fatal(err)
+	}
+	handlePassiveUsage(store, map[string]any{
+		"Provider": "xai",
+		"AuthID":   "xai-user.json",
+		"Model":    "grok-4.6",
+		"Detail":   map[string]any{"OutputTokens": int64(80), "ReasoningTokens": int64(70)},
+		"Latency":  float64(2500 * 1e6),
+		"TTFT":     float64(400 * 1e6),
+	})
+	got, _ := store.getNode(node.ID)
+	if got.LastClassification != "hard" || !strings.Contains(got.LastReason, "响应缺少 thinking_content（降智）") {
+		t.Fatalf("stream without thinking fields want hard, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+}
+
 func TestPassiveUsageSkipsMissingThinkingWhenThinkingOff(t *testing.T) {
 	prevStore := store
 	t.Cleanup(func() {
@@ -751,6 +807,16 @@ func TestManualDisabledAuthIsNotRestored(t *testing.T) {
 	}
 }
 
+func TestQualityDisabledAuthIsNotRestoredOrMigrated(t *testing.T) {
+	quality := authFile{Disabled: true, Raw: map[string]any{"disabled_reason": "egress-guard 账号降智: 硬阈值 Token/s=541.2"}}
+	if !isAccountQualityDisabled(quality) {
+		t.Fatal("账号降智 reason must be quality-disabled")
+	}
+	if isAccountQualityDisabled(authFile{Disabled: true, Raw: map[string]any{"disabled_reason": "egress-guard 隔离中"}}) {
+		t.Fatal("node-isolation disable must remain restorable")
+	}
+}
+
 func TestSchedulerSkipsCoolingStatuses(t *testing.T) {
 	for _, status := range []string{"disabled", "unavailable", "error", "cooling", "pending", "refreshing", "future-state"} {
 		if schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
@@ -864,6 +930,113 @@ func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
 	}
 	if disabled, _ := auths["manual.json"]["disabled"].(bool); !disabled {
 		t.Fatal("manual disabled auth was re-enabled")
+	}
+}
+
+func TestQualityDisabledAuthStaysDisabledOnRestoreAndMigrate(t *testing.T) {
+	prevStore := store
+	prevHost := hostCall
+	t.Cleanup(func() {
+		store = prevStore
+		hostCall = prevHost
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(good.ID, func(node *nodeRecord) error {
+		node.LastClassification = "healthy"
+		node.LastProbeAt = float64(time.Now().Unix())
+		node.ExitIP = "198.51.100.2"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(bad.ID, func(node *nodeRecord) error {
+		node.ExitIP = "198.51.100.1"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"quality.json": {
+			"type": "xai", "email": "florence@example.test", "access_token": "tok",
+			"proxy_url": bad.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 账号降智: 硬阈值 Token/s=541.2",
+		},
+		"isolated.json": {
+			"type": "xai", "email": "ok@example.test", "access_token": "tok2",
+			"proxy_url": bad.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 隔离中",
+		},
+	}
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	invalidateAuthListCache()
+	if err := enableAuthsOnNode(bad); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, _ := auths["quality.json"]["disabled"].(bool); !disabled {
+		t.Fatal("quality-disabled auth must stay disabled after node restore")
+	}
+	if disabled, _ := auths["isolated.json"]["disabled"].(bool); disabled {
+		t.Fatal("node-isolation disable should be restored")
+	}
+	invalidateAuthListCache()
+	if err := migrateAuthsOffNode(store, bad); err != nil {
+		t.Fatalf("migrateAuthsOffNode() error = %v", err)
+	}
+	if got := auths["quality.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("quality-disabled auth must stay on the original node, got %q", got)
+	}
+	if disabled, _ := auths["quality.json"]["disabled"].(bool); !disabled {
+		t.Fatal("quality-disabled auth must not be re-enabled by migrate")
+	}
+	if got := auths["isolated.json"]["proxy_url"]; got != good.ProxyURL {
+		t.Fatalf("node-isolated auth should migrate, got %q", got)
 	}
 }
 
@@ -1036,6 +1209,193 @@ func TestRequestInterceptorRejectsQuarantinedAuth(t *testing.T) {
 	_ = json.Unmarshal(env.Result, &response)
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("interceptor response=%+v", response)
+	}
+}
+
+func TestSingleNodeHardDisablesObservedAuth(t *testing.T) {
+	prevStore := store
+	prevHost := hostCall
+	t.Cleanup(func() {
+		store = prevStore
+		hostCall = prevHost
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("ipv6", "http://127.0.0.1:7951", true, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.MinHealthyNodes = 1
+	pol.DisableAuthOnHard = true
+	pol.SoftCrossVerify = false
+	pol.ThinkingCrossVerify = false
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"xai-florence.json": {
+			"type": "xai", "email": "florence@example.test", "access_token": "tok",
+			"proxy_url": node.ProxyURL, "disabled": false,
+		},
+		"xai-other.json": {
+			"type": "xai", "email": "other@example.test", "access_token": "tok2",
+			"proxy_url": node.ProxyURL, "disabled": false,
+		},
+	}
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	invalidateAuthListCache()
+	applyObservation(store, node.ID, "active", qualityResult{
+		Classification: "hard",
+		HasThinking:    true,
+		OutputTokens:   64,
+		TPS:            541.2,
+		AuthID:         "xai-florence.json",
+		AuthLabel:      "florence@example.test",
+		Error:          "硬阈值 Token/s=541.2",
+	})
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("single-node min_healthy=1 must still suppress node quarantine")
+	}
+	disabled, _ := auths["xai-florence.json"]["disabled"].(bool)
+	if !disabled {
+		t.Fatal("observed hard auth must be disabled even when node quarantine is suppressed")
+	}
+	if other, _ := auths["xai-other.json"]["disabled"].(bool); other {
+		t.Fatal("sibling accounts on the same node must stay enabled")
+	}
+}
+
+func TestSchedulerSkipsGuardDisabledAuth(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		invalidateAuthListCache()
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("ipv6", "http://127.0.0.1:7951", true, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authListMu.Lock()
+	authListCache = []authFile{
+		{ID: "auth-bad", Index: "auth-bad", Name: "xai-florence.json", Disabled: true, ProxyURL: node.ProxyURL},
+		{ID: "auth-good", Index: "auth-good", Name: "xai-other.json", Disabled: false, ProxyURL: node.ProxyURL},
+	}
+	authListAt = time.Now()
+	authListMu.Unlock()
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-bad": node.ProxyURL, "auth-good": node.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.SchedulerPickRequest{
+		Provider: "xai",
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "auth-bad", Provider: "xai"},
+			{ID: "auth-good", Provider: "xai"},
+		},
+	})
+	raw, err := handleSchedulerPick(rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("scheduler envelope=%s err=%v", raw, err)
+	}
+	var response pluginapi.SchedulerPickResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Handled || response.AuthID != "auth-good" {
+		t.Fatalf("disabled auth must be skipped, got %+v", response)
+	}
+}
+
+func TestRequestInterceptorRejectsGuardDisabledAuth(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		invalidateAuthListCache()
+		invalidateAuthProxyCache()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("ipv6", "http://127.0.0.1:7951", true, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authListMu.Lock()
+	authListCache = []authFile{
+		{ID: "auth-bad", Index: "auth-bad", Name: "xai-florence.json", Disabled: true, ProxyURL: node.ProxyURL},
+	}
+	authListAt = time.Now()
+	authListMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{"selected_auth_id": "auth-bad"}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(raw, &env)
+	var response pluginapi.RequestInterceptResponse
+	_ = json.Unmarshal(env.Result, &response)
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("disabled auth interceptor response=%+v", response)
+	}
+}
+
+func TestPreferAuthsPutsObservedAccountFirst(t *testing.T) {
+	got := preferAuths([]authFile{
+		{Name: "xai-other.json", Index: "xai-other.json"},
+		{Name: "xai-florence.json", Index: "xai-florence.json", Email: "florence@example.test"},
+	}, "xai-florence.json")
+	if len(got) != 2 || got[0].Name != "xai-florence.json" {
+		t.Fatalf("preferAuths=%+v", got)
 	}
 }
 
