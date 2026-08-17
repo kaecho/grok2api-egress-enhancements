@@ -5,12 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
-
-var schedulerCursor atomic.Uint64
 
 func isXAIProvider(provider string) bool {
 	provider = strings.ToLower(strings.TrimSpace(provider))
@@ -45,9 +42,13 @@ func schedulerCandidateAvailable(candidate pluginapi.SchedulerAuthCandidate) boo
 	}
 }
 
+func nodeAllowsTraffic(node *nodeRecord) bool {
+	return node != nil && node.Enabled && !node.DisabledByGuard
+}
+
 // handleSchedulerPick keeps the host scheduler from selecting an auth whose
-// proxy node is quarantined. Unmanaged providers and unbound accounts are
-// delegated to CPA's native scheduler.
+// proxy node is quarantined. Healthy and unmanaged candidates are left to
+// CPA's native strategy (fill-first / round-robin / weighted).
 func handleSchedulerPick(request []byte) ([]byte, error) {
 	ensureStore()
 	var req pluginapi.SchedulerPickRequest
@@ -67,6 +68,7 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 	}
 	cache := refreshAuthProxyCache()
 	eligible := make([]string, 0, len(req.Candidates))
+	filtered := false
 	managed := false
 	nonXAIAvailable := false
 	for _, candidate := range req.Candidates {
@@ -86,9 +88,11 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 		if !schedulerCandidateAvailable(candidate) {
 			continue
 		}
-		if node.Enabled && !node.DisabledByGuard {
+		if nodeAllowsTraffic(node) {
 			eligible = append(eligible, candidate.ID)
+			continue
 		}
+		filtered = true
 	}
 	if !managed {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
@@ -99,9 +103,13 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 		}
 		return errorEnvelope("egress_no_healthy_auth", "没有可用的健康 CPA 出口账号"), nil
 	}
-	index := schedulerCursor.Add(1) - 1
-	selected := eligible[index%uint64(len(eligible))]
-	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected})
+	if !filtered {
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+	// Host ABI cannot exclude candidates then re-run CPA's configured
+	// strategy. Keep the host's already-sorted first remaining auth so
+	// fill-first / priority order is not replaced by plugin round-robin.
+	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: eligible[0]})
 }
 
 // handleRequestInterceptAfterAuth closes the small race between auth selection

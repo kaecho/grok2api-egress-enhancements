@@ -627,6 +627,110 @@ func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
 	}
 }
 
+func TestSchedulerDefersHealthyManagedAuthsToCPA(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	first, err := store.createNode("first", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.createNode("second", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-a": first.ProxyURL, "auth-b": second.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.SchedulerPickRequest{
+		Provider: "xai",
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "auth-a", Provider: "xai"},
+			{ID: "auth-b", Provider: "xai"},
+		},
+	})
+	raw, err := handleSchedulerPick(rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("scheduler envelope=%s err=%v", raw, err)
+	}
+	var response pluginapi.SchedulerPickResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Handled || response.AuthID != "" {
+		t.Fatalf("healthy managed auths must leave scheduling to CPA: %+v", response)
+	}
+}
+
+func TestSchedulerKeepsHostOrderWhenFilteringQuarantine(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+	})
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	first, err := store.createNode("first", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.createNode("second", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.createNode("third", "http://127.0.0.1:7953", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(first.ID, func(node *nodeRecord) error { node.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{
+		"auth-a": first.ProxyURL,
+		"auth-b": second.ProxyURL,
+		"auth-c": third.ProxyURL,
+	}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.SchedulerPickRequest{
+		Provider: "xai",
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "auth-a", Provider: "xai"},
+			{ID: "auth-b", Provider: "xai"},
+			{ID: "auth-c", Provider: "xai"},
+		},
+	})
+	raw, err := handleSchedulerPick(rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("scheduler envelope=%s err=%v", raw, err)
+	}
+	var response pluginapi.SchedulerPickResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Handled || response.AuthID != "auth-b" {
+		t.Fatalf("filtered pick must keep host order, got %+v", response)
+	}
+}
+
 func TestRequestInterceptorRejectsQuarantinedAuth(t *testing.T) {
 	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)

@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.11** |
+| 当前版本 | **1.0.13** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -395,6 +395,8 @@ v1.0.11 起：
 - 节点行「绑定」可按数量一键写入账号 `proxy_url`：优先未绑定账号，不足再从其他节点抽调
 
 v1.0.12 修了管理页卡在「正在加载节点」：1.0.11 的绑定弹窗把 `qualityTest` 的 try/finally 写坏，整页 JS 无法执行。
+
+v1.0.13：健康账号不再由插件轮询选号，交回 CPA 的 `routing.strategy`（填充优先/轮询）。只有剔除隔离出口后才接管，并保留 CPA 已排好的第一个账号。
 
 v1.0.8 起额外修复商店安装后一直「未生效 / 未注册」：
 
