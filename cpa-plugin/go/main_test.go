@@ -197,8 +197,11 @@ func TestPassiveUsageSkipsMissingThinkingForImageRequest(t *testing.T) {
 	}
 	handlePassiveUsage(store, record)
 	got, _ := store.getNode(node.ID)
-	if got.LastClassification != "hard" || !strings.Contains(got.LastReason, "响应缺少 thinking_content（降智）") {
-		t.Fatalf("text-only missing thinking want hard+missing thinking, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	if got.LastClassification != "healthy" {
+		t.Fatalf("usage without reasoning_tokens is missing evidence, want TPS healthy, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+	if got.ThinkingStrikes != 0 {
+		t.Fatalf("usage without reasoning_tokens must not accumulate thinking strikes, got %d", got.ThinkingStrikes)
 	}
 
 	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
@@ -215,6 +218,121 @@ func TestPassiveUsageSkipsMissingThinkingForImageRequest(t *testing.T) {
 	}
 	if got.ThinkingStrikes != 0 {
 		t.Fatalf("image request must not accumulate thinking strikes, got %d", got.ThinkingStrikes)
+	}
+}
+
+func TestPassiveUsageUsesStreamThinkingEvidence(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetRequestHints()
+		invalidateAuthProxyCache()
+	})
+	resetRequestHints()
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 0
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.createNode("ipv6", "socks5h://u:p@127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		RequestID: "req-think-1",
+		Metadata:  map[string]any{"selected_auth_id": "xai-user.json"},
+		Body:      []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	rawChunk, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		RequestID:  "req-think-1",
+		ChunkIndex: 0,
+		Body:       []byte(`data: {"choices":[{"delta":{"reasoning_content":"step 1"}}]}`),
+	})
+	if _, err := handleStreamChunkIntercept(rawChunk); err != nil {
+		t.Fatal(err)
+	}
+	handlePassiveUsage(store, map[string]any{
+		"Provider": "xai",
+		"AuthID":   "xai-user.json",
+		"Model":    "grok-4.6",
+		"Detail":   map[string]any{"OutputTokens": int64(80)},
+		"Latency":  float64(2500 * 1e6),
+		"TTFT":     float64(400 * 1e6),
+	})
+	got, _ := store.getNode(node.ID)
+	if got.LastClassification != "healthy" {
+		t.Fatalf("stream thinking + usage without reasoning_tokens want healthy, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+	if got.ThinkingStrikes != 0 {
+		t.Fatalf("stream thinking must not accumulate thinking strikes, got %d", got.ThinkingStrikes)
+	}
+}
+
+func TestPassiveUsageHardWhenStreamSawNoThinking(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetRequestHints()
+		invalidateAuthProxyCache()
+	})
+	resetRequestHints()
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 0
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.createNode("ipv6", "socks5h://u:p@127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		RequestID: "req-think-2",
+		Metadata:  map[string]any{"selected_auth_id": "xai-user.json"},
+		Body:      []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	rawChunk, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		RequestID:  "req-think-2",
+		ChunkIndex: 0,
+		Body:       []byte(`data: {"choices":[{"delta":{"content":"hello"}}]}`),
+	})
+	if _, err := handleStreamChunkIntercept(rawChunk); err != nil {
+		t.Fatal(err)
+	}
+	handlePassiveUsage(store, map[string]any{
+		"Provider": "xai",
+		"AuthID":   "xai-user.json",
+		"Model":    "grok-4.6",
+		"Detail":   map[string]any{"OutputTokens": int64(80)},
+		"Latency":  float64(2500 * 1e6),
+		"TTFT":     float64(400 * 1e6),
+	})
+	got, _ := store.getNode(node.ID)
+	if got.LastClassification != "hard" || !strings.Contains(got.LastReason, "响应缺少 thinking_content（降智）") {
+		t.Fatalf("stream without thinking want hard, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+}
+
+func TestStreamChunkHasThinkingAcceptsResponsesEvents(t *testing.T) {
+	if !streamChunkHasThinking([]byte(`data: {"type":"response.reasoning_summary_text.delta","delta":"think"}`)) {
+		t.Fatal("responses reasoning delta should count as thinking")
+	}
+	if !streamChunkHasThinking([]byte(`data: {"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"opaque"}}`)) {
+		t.Fatal("reasoning output item should count as thinking")
+	}
+	if streamChunkHasThinking([]byte(`data: {"choices":[{"delta":{"content":"hi"}}]}`)) {
+		t.Fatal("plain content must not count as thinking")
 	}
 }
 

@@ -66,10 +66,13 @@ type requestHint struct {
 	Multimodal        bool
 	ThinkingRequested bool
 	ThinkingKnown     bool
+	StreamSeen        bool
+	StreamHasThinking bool
+	AuthKey           string
 }
 
 func rememberRequestHint(hint requestHint, keys ...string) {
-	if !hint.Multimodal && !hint.ThinkingKnown {
+	if !hint.Multimodal && !hint.ThinkingKnown && !hint.StreamSeen && strings.TrimSpace(hint.AuthKey) == "" {
 		return
 	}
 	hint.Until = time.Now().Add(multimodalUsageTTL)
@@ -86,6 +89,13 @@ func rememberRequestHint(hint requestHint, keys ...string) {
 		if hint.ThinkingKnown {
 			prev.ThinkingKnown = true
 			prev.ThinkingRequested = hint.ThinkingRequested
+		}
+		if hint.StreamSeen {
+			prev.StreamSeen = true
+			prev.StreamHasThinking = prev.StreamHasThinking || hint.StreamHasThinking
+		}
+		if hint.AuthKey != "" && prev.AuthKey == "" {
+			prev.AuthKey = hint.AuthKey
 		}
 		requestHintByAuth[key] = prev
 	}
@@ -380,9 +390,98 @@ func mapHasThinkingContent(m map[string]any) bool {
 	return false
 }
 
+func sseJSONPayload(body []byte) []byte {
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		if data[0] == '{' {
+			return data
+		}
+	}
+	body = bytes.TrimSpace(body)
+	if len(body) > 0 && body[0] == '{' {
+		return body
+	}
+	return nil
+}
+
+func streamChunkHasThinking(body []byte) bool {
+	payload := sseJSONPayload(body)
+	if len(payload) == 0 {
+		return false
+	}
+	var raw map[string]any
+	if json.Unmarshal(payload, &raw) != nil {
+		return false
+	}
+	if recordHasThinking(raw) {
+		return true
+	}
+	typ := strings.ToLower(firstString(raw, "type", "Type"))
+	if strings.Contains(typ, "reason") || strings.Contains(typ, "think") {
+		return true
+	}
+	if item, ok := raw["item"].(map[string]any); ok {
+		itemType := strings.ToLower(firstString(item, "type", "Type"))
+		if itemType == "reasoning" || strings.Contains(itemType, "think") {
+			return true
+		}
+		if mapHasThinkingContent(item) {
+			return true
+		}
+	}
+	if choices, ok := raw["choices"].([]any); ok {
+		for _, c := range choices {
+			cm, _ := c.(map[string]any)
+			if cm == nil {
+				continue
+			}
+			if delta, ok := cm["delta"].(map[string]any); ok && mapHasThinkingContent(delta) {
+				return true
+			}
+			if msg, ok := cm["message"].(map[string]any); ok && mapHasThinkingContent(msg) {
+				return true
+			}
+		}
+	}
+	if usage, ok := raw["usage"].(map[string]any); ok {
+		if firstInt(usage, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
+			return true
+		}
+		for _, nest := range []string{"completion_tokens_details", "output_tokens_details", "completionTokensDetails", "outputTokensDetails"} {
+			if details, ok := usage[nest].(map[string]any); ok && firstInt(details, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func rememberStreamChunk(body []byte, chunkIndex int, keys ...string) {
+	if chunkIndex < 0 || len(body) == 0 {
+		return
+	}
+	if hint, ok := recentRequestHint(keys...); ok && hint.StreamHasThinking {
+		return
+	}
+	rememberRequestHint(requestHint{
+		StreamSeen:        true,
+		StreamHasThinking: streamChunkHasThinking(body),
+	}, keys...)
+}
+
 // recordHasThinking derives a thinking signal from a CPA usage event.
 // Prefer explicit thinking/reasoning body fields; fall back to reasoning_tokens > 0
 // because passive usage rarely includes full response text.
+// A zero or omitted reasoning_tokens field is NOT evidence of missing thinking:
+// CPA's xAI usage parser only copies completion/output_tokens_details.reasoning_tokens,
+// and Grok /responses traffic often leaves that bucket empty even when the model thought.
 func recordHasThinking(record map[string]any) bool {
 	if record == nil {
 		return false
@@ -1581,6 +1680,13 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 			thinkingOn = hint.ThinkingRequested
 		}
 		if thinkingOn {
+			if !hasThinking && hasHint && hint.StreamSeen {
+				hasThinking = hint.StreamHasThinking
+			} else if !hasThinking {
+				// Usage omitted reasoning_tokens. Without a stream sample
+				// that is missing evidence, not missing thinking.
+				hasThinking = true
+			}
 			class = classifyQuality(tps, outTokens, hasThinking, pol)
 		} else {
 			// Client disabled thinking: missing thinking is expected, use TPS only.

@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.14"
+	pluginVersion       = "1.0.15"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -132,6 +132,8 @@ type registrationCapabilities struct {
 	UsagePlugin        bool `json:"usage_plugin"`
 	Scheduler          bool `json:"scheduler"`
 	RequestInterceptor bool `json:"request_interceptor"`
+	ResponseInterceptor     bool `json:"response_interceptor"`
+	StreamChunkInterceptor  bool `json:"response_stream_interceptor"`
 }
 
 type managementRegistration struct {
@@ -265,6 +267,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleRequestIntercept(request, false)
 	case pluginabi.MethodRequestInterceptAfter:
 		return handleRequestIntercept(request, true)
+	case pluginabi.MethodResponseInterceptAfter:
+		return handleResponseIntercept(request)
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		return handleStreamChunkIntercept(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -349,7 +355,14 @@ func pluginRegistration() registration {
 				{Name: "rotatable_node_ids", Type: pluginapi.ConfigFieldTypeArray, Description: "允许自动换 IP 的节点 ID；留空时禁止自动换 IP"},
 			},
 		},
-		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true, Scheduler: true, RequestInterceptor: true},
+		Capabilities: registrationCapabilities{
+			ManagementAPI:          true,
+			UsagePlugin:            true,
+			Scheduler:              true,
+			RequestInterceptor:     true,
+			ResponseInterceptor:    true,
+			StreamChunkInterceptor: true,
+		},
 	}
 }
 

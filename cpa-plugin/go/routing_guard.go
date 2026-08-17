@@ -135,6 +135,7 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 		if requested, known := requestThinkingRequested(req.Body); known {
 			rememberRequestHint(requestHint{ThinkingKnown: true, ThinkingRequested: requested}, selected)
 		}
+		rememberRequestHint(requestHint{AuthKey: selected}, selected, req.RequestID)
 	}
 	if selected == "" {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
@@ -162,4 +163,49 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 		},
 		ResponseBody: body,
 	})
+}
+
+func interceptAuthKeys(meta map[string]any, extra ...string) []string {
+	keys := make([]string, 0, 4)
+	if len(meta) > 0 {
+		for _, key := range []string{"selected_auth_id", "selectedAuthID", "auth_id", "authID", "auth_index", "authIndex"} {
+			if v := firstString(meta, key); v != "" {
+				keys = append(keys, v)
+			}
+		}
+	}
+	for _, key := range extra {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	// Stream intercepts often only carry RequestID. Recover the auth stashed
+	// by after-auth intercept so thinking evidence lands on the usage key.
+	if hint, ok := recentRequestHint(keys...); ok && hint.AuthKey != "" {
+		keys = append(keys, hint.AuthKey)
+	}
+	return keys
+}
+
+func handleStreamChunkIntercept(request []byte) ([]byte, error) {
+	var req pluginapi.StreamChunkInterceptRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return nil, fmt.Errorf("decode stream chunk intercept request: %w", err)
+	}
+	rememberStreamChunk(req.Body, req.ChunkIndex, interceptAuthKeys(req.Metadata, req.RequestID)...)
+	return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+}
+
+func handleResponseIntercept(request []byte) ([]byte, error) {
+	var req pluginapi.ResponseInterceptRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return nil, fmt.Errorf("decode response intercept request: %w", err)
+	}
+	if keys := interceptAuthKeys(req.Metadata, req.RequestID); len(keys) > 0 && len(req.Body) > 0 {
+		rememberRequestHint(requestHint{
+			StreamSeen:        true,
+			StreamHasThinking: streamChunkHasThinking(req.Body),
+		}, keys...)
+	}
+	return okEnvelope(pluginapi.ResponseInterceptResponse{})
 }

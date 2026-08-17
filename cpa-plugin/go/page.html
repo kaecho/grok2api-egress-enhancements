@@ -348,9 +348,9 @@
 
           <section class="policy-section" id="policy-section-thinking" aria-labelledby="policy-section-thinking-title">
             <h4 id="policy-section-thinking-title">Thinking 降智判定</h4>
-            <p class="section-note">以响应是否含 thinking / reasoning 作为降智主信号；可与交叉验证组合，避免单次误杀。</p>
+            <p class="section-note">以流/响应里是否真有 thinking 作为降智主信号。CPA usage 经常不带 reasoning_tokens，不能单独当证据。</p>
             <div class="form-grid">
-              <div class="field full check-row"><div><label for="policy-thinking-guard">启用 thinking 降智判定</label><p class="help">开启后：同一出口连续缺少 thinking_content 达到设定次数则隔离；有 thinking 时回落 Token/s 阈值</p></div><input id="policy-thinking-guard" type="checkbox"></div>
+              <div class="field full check-row"><div><label for="policy-thinking-guard">启用 thinking 降智判定</label><p class="help">开启后：流/响应亲眼缺 thinking 才计次；usage 没有 reasoning_tokens 不算缺 thinking，回落 Token/s</p></div><input id="policy-thinking-guard" type="checkbox"></div>
               <div class="field" id="policy-missing-count-wrap"><label for="policy-missing-thinking-count">连续缺 thinking 次数</label><input id="policy-missing-thinking-count" type="number" min="1" max="50"><p class="help">同一出口连续多少次无 thinking 才动作；默认 1</p></div>
               <div class="field full check-row" id="policy-thinking-cv-wrap"><div><label for="policy-thinking-cross-verify">thinking 交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，达到连续缺 thinking 次数后不立即隔离，先做一次主动质量探测；复测仍无 thinking 才判定降智。</p></div><input id="policy-thinking-cross-verify" type="checkbox"></div>
             </div>

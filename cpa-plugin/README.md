@@ -8,10 +8,10 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.14** |
+| 当前版本 | **1.0.15** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
-| 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
+| 能力 | Management UI + Usage Plugin + Scheduler + Request / Response / Stream Interceptor |
 | License | MIT（见仓库根目录 `LICENSE`） |
 
 ---
@@ -399,6 +399,8 @@ v1.0.12 修了管理页卡在「正在加载节点」：1.0.11 的绑定弹窗�
 v1.0.13：健康账号不再由插件轮询选号，交回 CPA 的 `routing.strategy`（填充优先/轮询）。只有剔除隔离出口后才接管，并保留 CPA 已排好的第一个账号。
 
 v1.0.14：带图片的 Grok 4.6 请求不再被误判为「缺少 thinking」。usage 事件本身没有请求体，拦截器先记下图文请求，被动审计跳过 missing-thinking；文本请求仍按原规则。客户端明确关闭 thinking（`reasoning.effort=none` / `reasoning_effort=none` / `thinking.type=disabled`）时也不再按缺 thinking 降智，只走 Token/s。
+
+v1.0.15：被动 usage 里没有 `reasoning_tokens` 不再当成「缺少 thinking」。CPA 的 xAI `/responses` 经常不带这个桶，TPS 正常也会被误报降智；主动探测走真实 SSE 所以交叉验证又回到 healthy。现在只在流/响应里亲眼见过输出、且没有 thinking 时才判缺 thinking；usage 只有 Token/s。
 
 v1.0.8 起额外修复商店安装后一直「未生效 / 未注册」：
 
