@@ -121,10 +121,21 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("decode request interceptor request: %w", err)
 	}
-	if !afterAuth || len(req.Metadata) == 0 {
+	if !afterAuth {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
-	selected := firstString(req.Metadata, "selected_auth_id", "selectedAuthID", "auth_id", "authID")
+	selected := ""
+	if len(req.Metadata) > 0 {
+		selected = firstString(req.Metadata, "selected_auth_id", "selectedAuthID", "auth_id", "authID")
+	}
+	if selected != "" && requestLooksMultimodal(req.Body) {
+		rememberMultimodalAuth(selected)
+	}
+	if selected != "" {
+		if requested, known := requestThinkingRequested(req.Body); known {
+			rememberRequestHint(requestHint{ThinkingKnown: true, ThinkingRequested: requested}, selected)
+		}
+	}
 	if selected == "" {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}

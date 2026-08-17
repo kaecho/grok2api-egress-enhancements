@@ -50,6 +50,186 @@ var (
 	authProxyAt    time.Time
 )
 
+// multimodalUsageTTL is how long a request-body image mark stays attached to
+// an auth so the later usage event (which has no request body) can skip the
+// thinking-guard false positive. Grok 4.6 vision replies often omit
+// reasoning_tokens even when the model did think.
+const multimodalUsageTTL = 2 * time.Minute
+
+var (
+	requestHintMu     sync.Mutex
+	requestHintByAuth map[string]requestHint
+)
+
+type requestHint struct {
+	Until             time.Time
+	Multimodal        bool
+	ThinkingRequested bool
+	ThinkingKnown     bool
+}
+
+func rememberRequestHint(hint requestHint, keys ...string) {
+	if !hint.Multimodal && !hint.ThinkingKnown {
+		return
+	}
+	hint.Until = time.Now().Add(multimodalUsageTTL)
+	requestHintMu.Lock()
+	if requestHintByAuth == nil {
+		requestHintByAuth = make(map[string]requestHint)
+	}
+	for _, key := range authHintKeys(keys...) {
+		prev := requestHintByAuth[key]
+		if hint.Until.After(prev.Until) {
+			prev.Until = hint.Until
+		}
+		prev.Multimodal = prev.Multimodal || hint.Multimodal
+		if hint.ThinkingKnown {
+			prev.ThinkingKnown = true
+			prev.ThinkingRequested = hint.ThinkingRequested
+		}
+		requestHintByAuth[key] = prev
+	}
+	now := time.Now()
+	for key, exp := range requestHintByAuth {
+		if now.After(exp.Until) {
+			delete(requestHintByAuth, key)
+		}
+	}
+	requestHintMu.Unlock()
+}
+
+func recentRequestHint(keys ...string) (requestHint, bool) {
+	now := time.Now()
+	requestHintMu.Lock()
+	defer requestHintMu.Unlock()
+	for _, key := range authHintKeys(keys...) {
+		if hint, ok := requestHintByAuth[key]; ok && now.Before(hint.Until) {
+			return hint, true
+		}
+	}
+	return requestHint{}, false
+}
+
+func authHintKeys(keys ...string) []string {
+	out := make([]string, 0, len(keys)*3)
+	seen := map[string]struct{}{}
+	add := func(key string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	for _, key := range keys {
+		add(key)
+		add(filepath.Base(key))
+		add(strings.TrimSuffix(filepath.Base(key), ".json"))
+	}
+	return out
+}
+
+func resetRequestHints() {
+	requestHintMu.Lock()
+	requestHintByAuth = nil
+	requestHintMu.Unlock()
+}
+
+func rememberMultimodalAuth(keys ...string) {
+	rememberRequestHint(requestHint{Multimodal: true}, keys...)
+}
+
+func recentMultimodalAuth(keys ...string) bool {
+	hint, ok := recentRequestHint(keys...)
+	return ok && hint.Multimodal
+}
+
+func resetMultimodalAuthMarks() {
+	resetRequestHints()
+}
+
+// requestLooksMultimodal reports image/vision input from an intercept body.
+// Cheap substring scan: usage events do not carry the original request.
+func requestLooksMultimodal(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	for _, needle := range [][]byte{
+		[]byte(`"image_url"`),
+		[]byte(`"imageUrl"`),
+		[]byte(`"input_image"`),
+		[]byte(`"inputImage"`),
+		[]byte(`"inline_data"`),
+		[]byte(`"inlineData"`),
+		[]byte("data:image/"),
+		[]byte(`"type":"image"`),
+		[]byte(`"type": "image"`),
+		[]byte("image/png"),
+		[]byte("image/jpeg"),
+		[]byte("image/jpg"),
+		[]byte("image/webp"),
+		[]byte("image/gif"),
+		[]byte("image/heic"),
+	} {
+		if bytes.Contains(body, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// requestThinkingRequested inspects an intercept body for an explicit
+// thinking on/off signal. Unknown / omitted config is left unset so Grok
+// default-on models still run the missing-thinking guard.
+func requestThinkingRequested(body []byte) (requested bool, known bool) {
+	if len(body) == 0 {
+		return false, false
+	}
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return false, false
+	}
+	effort := firstString(raw, "reasoning_effort", "reasoningEffort", "ReasoningEffort")
+	if effort == "" {
+		if reasoning, ok := raw["reasoning"].(map[string]any); ok {
+			effort = firstString(reasoning, "effort", "Effort")
+		}
+	}
+	if effort != "" {
+		return !thinkingEffortDisabled(effort), true
+	}
+	if thinkingObj, ok := raw["thinking"].(map[string]any); ok {
+		kind := firstString(thinkingObj, "type", "Type")
+		if kind != "" {
+			return !thinkingEffortDisabled(kind), true
+		}
+	}
+	return false, false
+}
+
+func thinkingEffortDisabled(effort string) bool {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "none", "off", "disabled", "disable", "0", "false":
+		return true
+	default:
+		return false
+	}
+}
+
+func usageThinkingRequested(record map[string]any) (requested bool, known bool) {
+	if record == nil {
+		return false, false
+	}
+	effort := firstString(record, "ReasoningEffort", "reasoning_effort", "reasoningEffort")
+	if effort != "" {
+		return !thinkingEffortDisabled(effort), true
+	}
+	return false, false
+}
+
 func invalidateAuthProxyCache() {
 	authProxyMu.Lock()
 	authProxyAt = time.Time{}
@@ -134,8 +314,37 @@ func classifyTPS(tps float64, soft, hard float64) string {
 // thinkingFieldNonEmpty reports whether a delta/message field carries real
 // thinking/reasoning text. Empty strings and whitespace-only values do not count.
 func thinkingFieldNonEmpty(v any) bool {
-	s, ok := v.(string)
-	return ok && strings.TrimSpace(s) != ""
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t) != ""
+	case []any:
+		for _, item := range t {
+			if thinkingPartNonEmpty(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		return thinkingPartNonEmpty(t)
+	}
+	return false
+}
+
+func thinkingPartNonEmpty(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok || m == nil {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(firstString(m, "type", "Type")))
+	switch kind {
+	case "thinking", "reasoning", "thought", "reasoning_content", "thinking_content":
+		return true
+	}
+	if thinkingFieldNonEmpty(m["thinking"]) || thinkingFieldNonEmpty(m["text"]) {
+		if kind == "" || strings.Contains(kind, "think") || strings.Contains(kind, "reason") {
+			return true
+		}
+	}
+	return mapHasThinkingContent(m)
 }
 
 // mapHasThinkingContent inspects OpenAI-compatible delta/message maps for the
@@ -148,9 +357,24 @@ func mapHasThinkingContent(m map[string]any) bool {
 		"thinking_content", "ThinkingContent", "thinkingContent",
 		"reasoning_content", "ReasoningContent", "reasoningContent",
 		"thinking", "Thinking",
+		"encrypted_content", "encryptedContent", "EncryptedContent",
 	} {
 		if thinkingFieldNonEmpty(m[key]) {
 			return true
+		}
+	}
+	for _, key := range []string{"content", "Content", "parts", "Parts"} {
+		switch v := m[key].(type) {
+		case []any:
+			for _, item := range v {
+				if thinkingPartNonEmpty(item) {
+					return true
+				}
+			}
+		case map[string]any:
+			if thinkingPartNonEmpty(v) {
+				return true
+			}
 		}
 	}
 	return false
@@ -1344,7 +1568,25 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	} else {
 		tps = computeTPS(outTokens, durMs, ttftMs, pol.MinGenerationMs)
 		hasThinking = recordHasThinking(record)
-		class = classifyQuality(tps, outTokens, hasThinking, pol)
+		hint, hasHint := recentRequestHint(authID, authIndex)
+		if !hasThinking && hasHint && hint.Multimodal {
+			// Vision/image turns often omit reasoning_tokens and thinking_content
+			// on the usage event. Do not treat that as missing-thinking 降智.
+			hasThinking = true
+		}
+		thinkingOn := true
+		if requested, known := usageThinkingRequested(record); known {
+			thinkingOn = requested
+		} else if hasHint && hint.ThinkingKnown {
+			thinkingOn = hint.ThinkingRequested
+		}
+		if thinkingOn {
+			class = classifyQuality(tps, outTokens, hasThinking, pol)
+		} else {
+			// Client disabled thinking: missing thinking is expected, use TPS only.
+			class = classifyQuality(tps, outTokens, true, pol)
+			hasThinking = true
+		}
 	}
 
 	// On anomaly, force auth-proxy cache refresh so we don't miss mappings.

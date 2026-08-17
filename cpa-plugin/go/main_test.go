@@ -113,6 +113,169 @@ func TestRecordHasThinkingFallsBackToReasoningTokens(t *testing.T) {
 	}
 }
 
+func TestRecordHasThinkingAcceptsReasoningContentParts(t *testing.T) {
+	if recordHasThinking(map[string]any{
+		"message": map[string]any{
+			"content": []any{
+				map[string]any{"type": "thinking", "thinking": "look at the photo"},
+				map[string]any{"type": "text", "text": "a cat"},
+			},
+		},
+	}) != true {
+		t.Fatal("typed thinking content parts should count as thinking")
+	}
+	if recordHasThinking(map[string]any{
+		"delta": map[string]any{"encrypted_content": "opaque-reasoning-blob"},
+	}) != true {
+		t.Fatal("encrypted_content should count as thinking")
+	}
+	if recordHasThinking(map[string]any{
+		"message": map[string]any{
+			"content": []any{
+				map[string]any{"type": "text", "text": "visible only"},
+			},
+		},
+	}) != false {
+		t.Fatal("plain text content parts must not count as thinking")
+	}
+}
+
+func TestRequestLooksMultimodal(t *testing.T) {
+	if !requestLooksMultimodal([]byte(`{"messages":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,aa"}}]}]}`)) {
+		t.Fatal("openai image_url body should look multimodal")
+	}
+	if !requestLooksMultimodal([]byte(`{"input":[{"type":"input_image","image_url":"https://example.invalid/a.png"}]}`)) {
+		t.Fatal("responses input_image should look multimodal")
+	}
+	if requestLooksMultimodal([]byte(`{"messages":[{"role":"user","content":"describe thinking"}]}`)) {
+		t.Fatal("plain text must not look multimodal")
+	}
+}
+
+func TestRequestThinkingRequested(t *testing.T) {
+	if requested, known := requestThinkingRequested([]byte(`{"reasoning":{"effort":"none"}}`)); !known || requested {
+		t.Fatalf("reasoning.effort=none want known+off, got known=%v requested=%v", known, requested)
+	}
+	if requested, known := requestThinkingRequested([]byte(`{"reasoning_effort":"high"}`)); !known || !requested {
+		t.Fatalf("reasoning_effort=high want known+on, got known=%v requested=%v", known, requested)
+	}
+	if requested, known := requestThinkingRequested([]byte(`{"thinking":{"type":"disabled"}}`)); !known || requested {
+		t.Fatalf("thinking.type=disabled want known+off, got known=%v requested=%v", known, requested)
+	}
+	if _, known := requestThinkingRequested([]byte(`{"messages":[{"role":"user","content":"hi"}]}`)); known {
+		t.Fatal("omitted thinking config must stay unknown")
+	}
+}
+
+func TestPassiveUsageSkipsMissingThinkingForImageRequest(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetMultimodalAuthMarks()
+		invalidateAuthProxyCache()
+	})
+	resetMultimodalAuthMarks()
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 0
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.createNode("ipv6", "socks5h://u:p@127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := map[string]any{
+		"Provider": "xai",
+		"AuthID":   "xai-user.json",
+		"Model":    "grok-4.6",
+		"Detail":   map[string]any{"OutputTokens": int64(80)},
+		"Latency":  float64(2500 * 1e6),
+		"TTFT":     float64(400 * 1e6),
+	}
+	handlePassiveUsage(store, record)
+	got, _ := store.getNode(node.ID)
+	if got.LastClassification != "hard" || !strings.Contains(got.LastReason, "响应缺少 thinking_content（降智）") {
+		t.Fatalf("text-only missing thinking want hard+missing thinking, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		Metadata: map[string]any{"selected_auth_id": "xai-user.json"},
+		Body:     []byte(`{"messages":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,aa"}}]}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	handlePassiveUsage(store, record)
+	got, _ = store.getNode(node.ID)
+	if got.LastClassification != "healthy" {
+		t.Fatalf("image request missing reasoning_tokens want healthy/TPS, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+	if got.ThinkingStrikes != 0 {
+		t.Fatalf("image request must not accumulate thinking strikes, got %d", got.ThinkingStrikes)
+	}
+}
+
+func TestPassiveUsageSkipsMissingThinkingWhenThinkingOff(t *testing.T) {
+	prevStore := store
+	t.Cleanup(func() {
+		store = prevStore
+		resetRequestHints()
+		invalidateAuthProxyCache()
+	})
+	resetRequestHints()
+	store = newStateStore(filepath.Join(t.TempDir(), "s.json"))
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.MinHealthyNodes = 0
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.createNode("ipv6", "socks5h://u:p@127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlePassiveUsage(store, map[string]any{
+		"Provider":        "xai",
+		"AuthID":          "xai-user.json",
+		"Model":           "grok-4.6",
+		"ReasoningEffort": "none",
+		"Detail":          map[string]any{"OutputTokens": int64(80)},
+		"Latency":         float64(2500 * 1e6),
+		"TTFT":            float64(400 * 1e6),
+	})
+	got, _ := store.getNode(node.ID)
+	if got.LastClassification != "healthy" {
+		t.Fatalf("thinking off want TPS-only healthy, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+	if got.ThinkingStrikes != 0 {
+		t.Fatalf("thinking off must not accumulate thinking strikes, got %d", got.ThinkingStrikes)
+	}
+
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		Metadata: map[string]any{"selected_auth_id": "xai-user.json"},
+		Body:     []byte(`{"reasoning":{"effort":"none"},"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if _, err := handleRequestIntercept(rawRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	handlePassiveUsage(store, map[string]any{
+		"Provider": "xai",
+		"AuthID":   "xai-user.json",
+		"Model":    "grok-4.6",
+		"Detail":   map[string]any{"OutputTokens": int64(90)},
+		"Latency":  float64(2600 * 1e6),
+		"TTFT":     float64(400 * 1e6),
+	})
+	got, _ = store.getNode(node.ID)
+	if got.LastClassification != "healthy" {
+		t.Fatalf("intercept thinking off want healthy, got class=%q reason=%q", got.LastClassification, got.LastReason)
+	}
+}
+
 func TestAccountQuotaExhaustedDetection(t *testing.T) {
 	for _, test := range []struct {
 		status int
